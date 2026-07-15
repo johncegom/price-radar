@@ -5,8 +5,8 @@ A personal Go program that checks whether a specific device (e.g. **MacBook Pro 
 
 ## Why
 - Manually re-checking a listing page for one specific device is tedious and easy to forget.
-- The target page is server-rendered and publicly accessible, so it can be checked mechanically without a login or a headless browser.
-- The project doubles as a **Go learning vehicle**: a small, real, end-to-end system (HTTP client → parser → storage → decision logic) using only the standard library, that can grow in scope as Go fluency grows.
+- The target page's initial batch is server-rendered and publicly accessible, so most of the pipeline can run mechanically without a login. Seeing the *full* ~650-item catalog does require driving the page's own "Load more" control (see [Compliance posture](#compliance-posture) below) — there's no URL-based pagination to fetch instead.
+- The project doubles as a **Go learning vehicle**: a small, real, end-to-end system (HTTP client → parser → storage → decision logic) built primarily on the standard library, that can grow in scope as Go fluency grows.
 
 ## What it does
 1. Fetches the listing page(s) on a schedule (not continuously).
@@ -22,12 +22,13 @@ This is built as a **single-site product first, multi-site design intent second*
 ## What it deliberately does not do (for now)
 - No scraping of other retailers or categories — one site, one page, one target spec today (see extensibility note above).
 - No login, no checkout automation, no purchase automation.
-- No headless browser / JS rendering — the target page is server-rendered HTML, so this isn't needed.
+- No filtered/query-parameter scraping and no reliance on the site's internal/undocumented API — see [Compliance posture](#compliance-posture).
 - No continuous/real-time polling — scheduled, low-frequency checks only.
 - No third-party HTTP framework — `net/http` only, by explicit design choice (see [System Architecture](03-system-architecture.md)).
 
 ## Compliance posture
-- Only the clean listing URL (and plain pagination) is fetched — never the filtered/query-parameter product URLs that `robots.txt` disallows.
+- Only the clean listing URL is ever fetched or driven — never the filtered/query-parameter product URLs that `robots.txt` disallows (e.g. `?hang-san-xuat=`, `?ram=`, and the other faceted-filter params), and never the disallowed `/ajax/` path or the site's undocumented internal API.
+- There is no URL-based pagination on this listing (confirmed by testing `?trang=`, `?page=`, `?p=` — all return an identical response to the base URL). The full ~650-item catalog is only reachable through the page's own client-side "Load more" control, so seeing it in full requires driving a headless browser (see [System Architecture § Browser Automation](03-system-architecture.md#internalbrowser)) against the same permitted URL — never a different, disallowed one.
 - Requests are infrequent (hours between runs, not seconds), with a realistic User-Agent and backoff on errors — matching the low-volume, public-endpoint-only approach already used elsewhere in this workspace's job-scraper tooling.
 
 ## Companion documents

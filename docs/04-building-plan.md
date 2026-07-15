@@ -157,15 +157,47 @@ Done when: the real target device reliably appears in the shortlist across a few
 
 ---
 
+## Phase 6.5 — Full catalog via headless browser + Agent hand-off
+
+Weekly outcome: fetch the *entire* ~650-item catalog (not just the ~30-40 item first batch) by driving the page's own "Load more" control, and hand off to the wrapping Agent instead of guessing when that control can't be found.
+Evidence of completion: a run against the live site reports a product count close to the full catalog size, not just the first batch; deliberately breaking the selector produces a screenshot on disk and exit code 2 instead of a crash or a silent partial result.
+Concepts introduced: driving an external library (`chromedp`) as a scoped, deliberate exception to stdlib-only; XPath/text-content selectors vs. brittle CSS-class selectors; a three-way process exit contract (success / hard error / needs-agent-review) instead of a boolean one.
+
+Why this phase exists at all: earlier investigation (see [Project Description § Compliance posture](01-project-description.md#compliance-posture)) found there's no URL-based pagination on this listing, the filtered/query-param URLs are `robots.txt`-disallowed, and the site's internal API is undocumented — so a headless browser driving the *same permitted URL* a real user would use is the only compliant, full-coverage option.
+
+**Checkpoint 6.5.1 — Click "Load more" until exhausted**
+Why now: the prefilter from Phase 6 only does its job meaningfully against the full listing — a partial catalog undermines the recall-over-precision design it was built on.
+Change: `internal/browser` opens one chromedp context against the listing URL, loops: locate the control by its **visible text** ("Xem thêm"), click, wait for new cards, repeat until the control disappears.
+Run: `go run .` against the live site.
+Expected: parsed product count is close to the full catalog (~650), not the ~30-40 of the first batch.
+New idea: selecting by what a human reads (text content), not by implementation-detail styling (Tailwind utility classes, which regenerate on every frontend rebuild) — the more stable signal isn't always the one that looks like a normal CSS selector.
+Break it: point the selector at one of the button's Tailwind classes instead of its text, then have the site (or a saved fixture) change classes on a rebuild — observe the click silently fail to find anything.
+Transfer: revert to the text-based selector yourself and explain in one sentence why it's the more durable choice here.
+Done when: a full-catalog run completes and you can state why URL pagination wasn't an option (cite the empirical test from Phase 6.5's intro).
+
+**Checkpoint 6.5.2 — Screenshot + exit-code hand-off on selector miss**
+Why now: "the site changed and broke our selector" is exactly the kind of ambiguous, non-deterministic judgment call this project already hands to an Agent rather than hardcoding around (same principle as Phase 8's matching judgment) — but this one is about the *scraping mechanism*, not the *product*.
+Change: when the text-based selector in 6.5.1 finds nothing, capture a full-page screenshot via chromedp (the browser context is already open, so this is nearly free), write it to `internal/tmp/`, and exit `2` with a `needs_agent_review` JSON payload (see [System Architecture § CLI contract](03-system-architecture.md#cmdpriceradar-one-shot-cli)) instead of panicking or returning an empty list.
+Run: temporarily break the selector on purpose, run the binary, confirm exit code 2 and a real screenshot file.
+Expected: process exits 2; `internal/tmp/` contains a screenshot; stdout has `status`, `reason`, and `screenshot_path` fields.
+New idea: a three-way exit contract (0/1/2) as a way to make "I genuinely can't decide this" a first-class, structured outcome — distinct from both success and hard failure — so the layer that *can* decide (the wrapping Agent, already running this CLI against the repo) knows exactly when and how to step in.
+Break it: delete the screenshot file after it's written but before the Agent would read it, and observe what the Agent actually does with a `needs_agent_review` result it can't act on — this is the failure mode worth understanding before relying on the contract.
+Transfer: explain, from memory, why this hand-off writes files and an exit code rather than the Go program calling an LLM API directly.
+Done when: the selector-miss path is demonstrated end-to-end (break it → screenshot appears → exit 2 → fix it → normal run resumes), and you can explain why this is a *mechanical* judgment call, not the same kind as Phase 8's product-matching judgment.
+
+*(Deferred, not built now: a formalized MCP tool version of this hand-off — `verify_page_structure` — once [Phase 9's MCP extension](#phase-9--mcp-extension-optional) exists. The exit-code contract already works; building the MCP tool now would front-run work that's itself optional and deferred.)*
+
+---
+
 ## Phase 7 — One-shot CLI wiring
 
-Weekly outcome: a single `priceradar` binary that runs config → fetch → parse → prefilter → store → JSON stdout, ready for a scheduler to call.
-Evidence of completion: `priceradar` run from a fresh shell (not `go run .`) produces valid JSON on stdout and a non-zero exit + `{error, code}` JSON on a forced failure.
+Weekly outcome: a single `priceradar` binary that runs config → fetch (incl. full-catalog browser pass) → parse → prefilter → store → JSON stdout, ready for a scheduler (or a wrapping Agent) to call.
+Evidence of completion: `priceradar` run from a fresh shell (not `go run .`) produces valid JSON on stdout on success, `{error, code}` + non-zero exit on a forced hard failure, and exit code 2 + `needs_agent_review` JSON on a forced selector miss.
 Concepts introduced: `flag` or manual `os.Args` parsing (no CLI framework), `encoding/json.Marshal` for stdout contracts, exit codes via `os.Exit`.
 
 **Checkpoint 7.1 — Config-driven run**
-Why now: hardcoded target specs don't scale past one device; this is also the natural point to freeze the CLI's I/O contract before anything downstream (agent, scheduler) depends on it.
-Change: `config.json` holds target spec(s) + listing URL + thresholds; `main.go` loads it, wires the phases 1–6 pipeline together, and prints one JSON object to stdout.
+Why now: hardcoded target specs don't scale past one device; this is also the natural point to freeze the CLI's I/O contract (all three exit codes) before anything downstream (agent, scheduler) depends on it.
+Change: `config.json` holds target spec(s) + listing URL + thresholds; `main.go` loads it, wires the phases 1–6.5 pipeline together, and prints one JSON object to stdout.
 Run: `./priceradar` (built binary) with a real `config.json`.
 Expected: valid JSON with `shortlist` and `since_last_run` fields.
 Break it: point `config.json` at a malformed JSON file and confirm the program exits non-zero with a `{error, code}` JSON on stderr, not a raw Go panic/stack trace.
