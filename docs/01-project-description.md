@@ -34,3 +34,4 @@ This is built as a **single-site product first, multi-site design intent second*
 ## Companion documents
 - [Solution Architecture](02-solution-architecture.md) — what the system is made of and how data flows through it, at a conceptual level.
 - [System Architecture](03-system-architecture.md) — the concrete Go tech stack, package layout, and deployment shape.
+- [Implementation Plan](04-implementation-plan.md) — the epic/task breakdown agents execute against, in build order.

@@ -89,3 +89,4 @@ Only `internal/httpclient` + `internal/parser` are site-specific. If/when a seco
 - `docs/01-project-description.md` — what it is, why it exists, what it deliberately doesn't do, compliance posture.
 - `docs/02-solution-architecture.md` — the conceptual pipeline, design rationale, "why this shape, not simpler."
 - `docs/03-system-architecture.md` — concrete Go package layout, component-by-component detail, CLI/MCP contracts, deployment shape.
+- `docs/04-implementation-plan.md` — the epic/task breakdown for building the pipeline, in dependency order; follow this when picking up implementation work.
