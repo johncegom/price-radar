@@ -129,4 +129,4 @@ internal/
   model/                      # unchanged
 ```
 
-`config.json` would gain a `site` field per target so the CLI knows which `siteplugin` implementation to invoke; everything downstream of `[]model.Product` — prefilter, judgment, store, notify — needs no changes at all. This restructuring is a Phase-10-or-later concern in the [Building Plan](04-building-plan.md), deliberately deferred until a second real site justifies the abstraction.
+`config.json` would gain a `site` field per target so the CLI knows which `siteplugin` implementation to invoke; everything downstream of `[]model.Product` — prefilter, judgment, store, notify — needs no changes at all. This restructuring is deliberately deferred until a second real site justifies the abstraction.

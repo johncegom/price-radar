@@ -6,7 +6,7 @@ A personal Go program that checks whether a specific device (e.g. **MacBook Pro 
 ## Why
 - Manually re-checking a listing page for one specific device is tedious and easy to forget.
 - The target page's initial batch is server-rendered and publicly accessible, so most of the pipeline can run mechanically without a login. Seeing the *full* ~650-item catalog does require driving the page's own "Load more" control (see [Compliance posture](#compliance-posture) below) — there's no URL-based pagination to fetch instead.
-- The project doubles as a **Go learning vehicle**: a small, real, end-to-end system (HTTP client → parser → storage → decision logic) built primarily on the standard library, that can grow in scope as Go fluency grows.
+- The project doubles as a **testbed for high-autonomy AI agent development**: a small, real, end-to-end system (HTTP client → parser → storage → decision logic) built and driven by AI agents operating directly against this repo, that can grow in scope as agent autonomy and coordination patterns (single agent → agent swarm) are explored.
 
 ## What it does
 1. Fetches the listing page(s) on a schedule (not continuously).
@@ -34,4 +34,3 @@ This is built as a **single-site product first, multi-site design intent second*
 ## Companion documents
 - [Solution Architecture](02-solution-architecture.md) — what the system is made of and how data flows through it, at a conceptual level.
 - [System Architecture](03-system-architecture.md) — the concrete Go tech stack, package layout, and deployment shape.
-- [Building Plan](04-building-plan.md) — the phased, checkpoint-driven plan for learning Go by building this project.

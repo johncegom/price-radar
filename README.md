@@ -4,14 +4,13 @@ A personal Go program that checks whether a specific device (e.g. **MacBook Pro 
 
 ## How this is built
 
-**This project is built by a human, learning Go.** It exists as a hands-on Go learning vehicle, not a generated codebase, and every line of code is written and understood by its author.
+**This project is built autonomously by AI agents.** It's a testbed for high-autonomy, multi-agent development — an agent (or swarm of agents) plans, writes, reviews, and iterates on the implementation directly against this repo, with a human in an oversight/approval role rather than an authoring one.
 
-AI is used only in supporting roles, never as the author of the implementation:
-- **Structured guide** — a phased, checkpoint-driven learning plan (see [Building Plan](docs/04-building-plan.md)) that introduces one Go concept at a time, in the order the project actually needs it, with "break it / fix it" exercises at each step.
-- **Exploration** — researching approaches, tradeoffs, and idiomatic Go before a decision is made.
-- **Quality assurance** — reviewing code after it's written, catching mistakes, and suggesting improvements.
+- **Agent-driven implementation** — code is planned and written by AI agents operating with direct file access to this repo, not hand-written line by line.
+- **Swarm-friendly design** — the architecture's judgment/deterministic-core split (see [Solution Architecture](docs/02-solution-architecture.md)) doubles as a natural task boundary between agents or agent runs: fetch/parse/store work is mechanical and parallelizable, judgment work is where agent autonomy is exercised.
+- **Human oversight** — the human maintainer reviews direction and outcomes, not every line; the goal is to explore how far agents can be trusted to drive without step-by-step human authorship.
 
-The goal is fluency in Go, not a finished artifact shipped as fast as possible.
+The goal is practice operating agent swarms at a high level of autonomy, not a hand-crafted artifact.
 
 ## Why this exists
 
@@ -91,11 +90,10 @@ The `cmd/priceradar-mcp` extension ([System Architecture § MCP Extension](docs/
 
 ## Status
 
-Early stage — planning only, no code yet. Development follows the phased [Building Plan](docs/04-building-plan.md), starting from a toolchain smoke test and building up one Go concept at a time toward the full pipeline above.
+Early stage — planning only, no code yet. Implementation proceeds via autonomous AI agent runs against this repo, guided by the architecture docs below rather than a human-paced curriculum.
 
 ## Docs
 
 - [Project Description](docs/01-project-description.md) — what it is, why it exists, what it deliberately doesn't do.
 - [Solution Architecture](docs/02-solution-architecture.md) — the conceptual pipeline and design rationale.
 - [System Architecture](docs/03-system-architecture.md) — the concrete Go tech stack, package layout, and deployment shape.
-- [Building Plan](docs/04-building-plan.md) — the phased, checkpoint-driven plan for learning Go by building this project.
