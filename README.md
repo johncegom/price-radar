@@ -94,6 +94,7 @@ Early stage — planning only, no code yet. Implementation proceeds via autonomo
 
 ## Docs
 
+- [PRD](docs/00-prd.md) — the agreed v1 requirements, non-goals, and acceptance criteria; read this first.
 - [Project Description](docs/01-project-description.md) — what it is, why it exists, what it deliberately doesn't do.
 - [Solution Architecture](docs/02-solution-architecture.md) — the conceptual pipeline and design rationale.
 - [System Architecture](docs/03-system-architecture.md) — the concrete Go tech stack, package layout, and deployment shape.

@@ -86,6 +86,7 @@ Only `internal/httpclient` + `internal/parser` are site-specific. If/when a seco
 
 ## Docs
 
+- `docs/00-prd.md` — the agreed v1 requirements, non-goals, and acceptance criteria; check this before treating an ambiguous case as an invitation to expand scope.
 - `docs/01-project-description.md` — what it is, why it exists, what it deliberately doesn't do, compliance posture.
 - `docs/02-solution-architecture.md` — the conceptual pipeline, design rationale, "why this shape, not simpler."
 - `docs/03-system-architecture.md` — concrete Go package layout, component-by-component detail, CLI/MCP contracts, deployment shape.
