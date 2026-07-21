@@ -32,6 +32,7 @@ This is built as a **single-site product first, multi-site design intent second*
 - Requests are infrequent (hours between runs, not seconds), with a realistic User-Agent and backoff on errors — matching the low-volume, public-endpoint-only approach already used elsewhere in this workspace's job-scraper tooling.
 
 ## Companion documents
+- [PRD](00-prd.md) — the agreed v1 requirements, non-goals, and acceptance criteria; the front-door doc for scope questions.
 - [Solution Architecture](02-solution-architecture.md) — what the system is made of and how data flows through it, at a conceptual level.
 - [System Architecture](03-system-architecture.md) — the concrete Go tech stack, package layout, and deployment shape.
 - [Implementation Plan](04-implementation-plan.md) — the epic/task breakdown agents execute against, in build order.
