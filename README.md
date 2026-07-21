@@ -99,3 +99,4 @@ Early stage — planning only, no code yet. Implementation proceeds via autonomo
 - [Solution Architecture](docs/02-solution-architecture.md) — the conceptual pipeline and design rationale.
 - [System Architecture](docs/03-system-architecture.md) — the concrete Go tech stack, package layout, and deployment shape.
 - [Implementation Plan](docs/04-implementation-plan.md) — the epic/task breakdown agents execute against, in build order.
+- [Architecture Decision Records](docs/05-decisions.md) — the running log of why key architectural decisions were made, and the process for changing one.
