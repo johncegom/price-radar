@@ -1,6 +1,6 @@
 # PriceRadar — PRD
 
-This is the front-door requirements doc: what was agreed for v1, stated as testable requirements, so any agent picking up work later checks itself against this rather than reconstructing intent from the other docs. Read this first. For *why* it exists, see [Project Description](01-project-description.md); for *how* it's designed, see [Solution Architecture](02-solution-architecture.md) and [System Architecture](03-system-architecture.md); for *build order*, see [Implementation Plan](04-implementation-plan.md).
+This is the front-door requirements doc: what was agreed for v1, stated as testable requirements, so any agent picking up work later checks itself against this rather than reconstructing intent from the other docs. Read this first. For *why* it exists, see [Project Description](01-project-description.md); for *how* it's designed, see [Solution Architecture](02-solution-architecture.md) and [System Architecture](03-system-architecture.md); for *build order*, see [Implementation Plan](04-implementation-plan.md); for *why key decisions were made*, see [Decisions](05-decisions.md).
 
 ## Problem & goal
 

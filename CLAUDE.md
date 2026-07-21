@@ -91,3 +91,4 @@ Only `internal/httpclient` + `internal/parser` are site-specific. If/when a seco
 - `docs/02-solution-architecture.md` — the conceptual pipeline, design rationale, "why this shape, not simpler."
 - `docs/03-system-architecture.md` — concrete Go package layout, component-by-component detail, CLI/MCP contracts, deployment shape.
 - `docs/04-implementation-plan.md` — the epic/task breakdown for building the pipeline, in dependency order; follow this when picking up implementation work.
+- `docs/05-decisions.md` — the Architecture Decision Record log: why things are the way they are, kept separate from the PRD/architecture docs (which describe current state only). When a human and agent agree to change an established architectural decision, add an ADR entry here *and* update the affected PRD/architecture section — don't do just one.
