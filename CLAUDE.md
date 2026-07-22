@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-Early stage — planning only, no Go code yet. There is no `go.mod`, no `cmd/`, no `internal/` on disk yet. This repo currently consists of `README.md` and `docs/`. When implementation starts, build it per the architecture documented below and in `docs/`; there are no build/lint/test commands to run until then. Once a Go module exists, standard commands apply: `go run .` / `go build ./...` / `go test ./...` (a single test: `go test ./internal/<pkg> -run TestName`).
+Early stage — repo scaffold only (`go.mod`, stub `internal/*` packages, a `config.json` loader in `cmd/priceradar/main.go`). No pipeline logic wired up yet. Build/test as a normal Go module regardless of the AWS Lambda deployment target described below: `go run .` / `go build ./...` / `go test ./...` (a single test: `go test ./internal/<pkg> -run TestName`). Deployment to Lambda is a packaging/invocation concern layered on top of an ordinary Go binary — it must not require AWS credentials or a deployed function to build, test, or run the pipeline locally.
 
 ## What this is
 
@@ -19,52 +19,56 @@ The whole architecture hinges on this split — read it before touching any pipe
 | Layer | Owns | Why |
 |---|---|---|
 | **Deterministic core** (Go) | Fetch, parse, cheap prefiltering, storage | Fast, free, reliable — no ambiguity to resolve |
-| **Judgment layer** (AI agent, at runtime) | Resolving ambiguous device-name matches, deciding if a price is worth flagging | Naming variation and "is this a good deal" are contextual, not rule-shaped |
+| **Judgment layer** (Claude API call, made by the Lambda handler at runtime) | Resolving ambiguous device-name matches, deciding if a price is worth flagging | Naming variation and "is this a good deal" are contextual, not rule-shaped |
 
-Only a short list (0–5 candidates), never the full ~650-item catalog, is ever handed to the judgment layer — this keeps the non-deterministic/expensive work proportional to actual ambiguity. Do not add LLM calls inside the deterministic core; the boundary is intentional (see `docs/02-solution-architecture.md`, "Why this shape, not simpler").
+Only a short list (0–5 candidates), never the full ~650-item catalog, is ever handed to the judgment layer — this keeps the non-deterministic/expensive work proportional to actual ambiguity. Do not add LLM calls inside `httpclient`/`browser`/`parser`/`prefilter`/`store` — those stay deterministic. `internal/judge` (the one package that calls the Claude API) is the sole exception, and it runs *after* prefiltering, over the shortlist only — see ADR-010 in `docs/05-decisions.md` for why this moved from an external wrapping-agent invocation to an in-process runtime API call, and why selector-miss handling (below) deliberately did **not** make the same move.
 
 ## Pipeline (planned package layout)
 
 ```
 priceradar/
   cmd/
-    priceradar/            # one-shot CLI entrypoint (default, scheduler-invoked)
+    priceradar/            # Lambda handler entrypoint (default, EventBridge Scheduler-invoked); also runnable/testable locally, not AWS-only
     priceradar-mcp/        # optional MCP server entrypoint (extension, build later)
   internal/
     httpclient/            # net/http.Client wrapper: UA header, timeout, retry/backoff
-    browser/                # chromedp wrapper: navigate, click "Load more" loop, screenshot-on-selector-miss
+    browser/                # chromedp wrapper: navigate, click "Load more" loop, screenshot-on-selector-miss (uploads to S3)
     parser/                 # HTML -> []Product via regexp
     prefilter/              # token-overlap scoring -> ShortList
-    store/                  # JSON price-history read/append
+    store/                  # JSON price-history read/append, backed by a single S3 object
+    judge/                   # Claude API client: shortlist + skill/judgment.md -> verdict
+    notify/                  # verdict/alert delivery: log line + SNS
     model/                  # shared structs: Product, Snapshot, Candidate, Target
-    tmp/                    # generated at runtime — screenshots written on selector-miss
   skill/
-    judgment.md             # agent instructions: matching rules, notify rules, output contract
-  config.json                # target device spec(s), listing URL, notify thresholds
-  price-history.json          # generated at runtime — append-only snapshot log
+    judgment.md             # judgment-layer instructions: matching rules, notify rules, output contract (embedded into the Lambda package via go:embed)
+  config.json                # target device spec(s), listing URL, notify thresholds, S3/SNS identifiers
 ```
 
-Data flow: Scheduler → Fetch (httpclient for initial batch, browser/chromedp to exhaust "Load more" for the full ~650-item catalog) → Parse → Deterministic Prefilter → (shortlist) Agent Judgment → Price History Store / Notify.
+`price-history.json` is no longer a repo-local file — it's the object key inside the S3 bucket configured in `config.json`. Selector-miss screenshots go to S3 too (see Selector strategy below), not a local `internal/tmp/`.
+
+Data flow: EventBridge Scheduler → Lambda invocation → Fetch (httpclient for initial batch, browser/chromedp to exhaust "Load more" for the full ~650-item catalog) → Parse → Deterministic Prefilter → (shortlist) Judgment (`internal/judge` calls the Claude API) → Price History Store (S3) / Notify (SNS) — all within one Lambda invocation, no external round trip.
 
 ## Tech stack constraints (deliberate, don't deviate without discussion)
 
-- **No HTTP framework** — `net/http` only (no gin/echo/chi), for both the CLI's outbound requests and the future MCP server transport.
+- **No HTTP framework** — `net/http` only (no gin/echo/chi), for the outbound site fetch, the Claude API call in `internal/judge`, and the future MCP server transport.
 - **No third-party HTML parser by default** — `regexp` (stdlib) for parsing product cards. `golang.org/x/net/html` is an explicitly-flagged fallback only if regex proves too fragile, not a default choice.
-- **`chromedp` is the one sanctioned third-party dependency**, scoped narrowly to `internal/browser`, because the listing has no URL-based pagination (`?trang=`, `?page=`, `?p=` all verified to return the identical first batch) and the site's internal API + filtered-URL scraping are both off-limits (see Compliance below). Don't reach for `go-rod`/`playwright-go` or add other dependencies without an equivalent justification.
-- **Storage:** `encoding/json`, flat file (`price-history.json`), no database. Writes must be atomic: temp file + `os.Rename`, never a direct in-place write.
-- **Scheduling:** OS-level (Windows Task Scheduler / cron) driving a one-shot binary — not an in-process daemon/goroutine scheduler.
+- **`chromedp` is the one sanctioned third-party dependency for scraping**, scoped narrowly to `internal/browser`, because the listing has no URL-based pagination (`?trang=`, `?page=`, `?p=` all verified to return the identical first batch) and the site's internal API + filtered-URL scraping are both off-limits (see Compliance below). Don't reach for `go-rod`/`playwright-go` or add other scraping dependencies without an equivalent justification. On Lambda, chromedp additionally needs a headless-Chromium Lambda Layer (e.g. a `sparticuz/chromium`-style prebuilt layer) — see `docs/03-system-architecture.md` for the layer/memory/timeout details.
+- **AWS SDK for Go v2** (`aws-sdk-go-v2`, S3 + SNS clients only) and **`aws-lambda-go`** (the Lambda runtime shim) are sanctioned dependencies for the AWS integration surface — same "narrowly scoped, deliberately justified" treatment as chromedp, not a general license to add AWS SDK modules elsewhere.
+- **Storage:** `encoding/json`, one JSON object (`price-history.json` as an S3 key), no database. Writes are whole-object `PutObject` calls — S3 already makes a single object write atomic from a reader's perspective, so there's no local temp-file/`os.Rename` step to replicate.
+- **Scheduling:** AWS EventBridge Scheduler invoking the Lambda function on a cron expression — not an in-process daemon/goroutine scheduler, and not an OS-level scheduler (superseded; see ADR-006).
+- **Judgment-layer LLM calls:** the Claude API, called directly from `internal/judge` inside the Lambda handler over `net/http` (no SDK needed for a single-request/response call) — see ADR-010. Structure-verification (selector-miss, below) deliberately does **not** get this treatment.
 
-## CLI exit-code contract
+## Lambda handler outcome contract
 
-`cmd/priceradar` uses a **three-way** exit contract, not just success/failure — preserve this shape if you touch `main()`:
+`cmd/priceradar`'s handler uses a **three-way** outcome contract, adapted from the original CLI exit-code design for Lambda's `(response, error)` handler shape — preserve this shape if you touch the handler:
 
-| Exit code | Meaning | Output |
+| Outcome | Lambda return | Meaning |
 |---|---|---|
-| `0` | Success | JSON with `shortlist` and `since_last_run` fields on stdout |
-| `1` | Hard error | `{error, code}` JSON on stderr |
-| `2` | `needs_agent_review` — `internal/browser` couldn't locate the "Load more" control | JSON on stdout: `{"status": "needs_agent_review", "step": "load_more_detection", "reason": "primary_selector_not_found", "screenshot_path": ..., "dom_candidates": [...]}` |
+| Success | `(Response{shortlist, since_last_run, ...}, nil)` | Normal run, JSON response body |
+| Hard error | `(nil, err)` | Network/config/store failure — Lambda records an invocation error; EventBridge's retry policy may retry, and a configured on-failure destination (e.g. SNS) can alert after retries are exhausted |
+| `needs_agent_review` | `(Response{status: "needs_agent_review", step: "load_more_detection", reason: "primary_selector_not_found", screenshot_url: <S3 URL>, dom_candidates: [...]}, nil)` | `internal/browser` couldn't locate the "Load more" control |
 
-Exit code 2 is a deliberate hand-off, not an error variant: the deterministic core recognized it can't decide something mechanical and stops rather than guessing. It's a *different* judgment than the shortlist/product-matching judgment — it's about whether the scraping mechanism still matches reality.
+`needs_agent_review` deliberately returns as a **successful** invocation (`nil` error), not a Lambda error — retrying immediately won't fix a broken selector, so this must not trigger Lambda's automatic retry storm. Instead the handler itself uploads the screenshot to S3 and publishes an SNS notification before returning, so a human/agent can review it later; see ADR-009. This mirrors the original exit-code design's intent — distinguishing "retry might help" from "a human/agent needs to look at this" — just adapted to Lambda's return-value contract instead of a process exit code that an always-present watcher would inspect live.
 
 ## Compliance constraints (do not violate when writing fetch/browser code)
 
@@ -74,11 +78,13 @@ Exit code 2 is a deliberate hand-off, not an error variant: the deterministic co
 
 ## Selector strategy (internal/browser)
 
-Select the "Load more" control by its **visible text content** ("Xem thêm"), not by CSS/Tailwind utility classes — those regenerate on every frontend rebuild and are not a stable signal. On selector miss, capture a full-page screenshot to `internal/tmp/` and surface `needs_agent_review` (exit 2) rather than panicking or silently returning a partial list.
+Select the "Load more" control by its **visible text content** ("Xem thêm"), not by CSS/Tailwind utility classes — those regenerate on every frontend rebuild and are not a stable signal. On selector miss, capture a full-page screenshot and upload it to the S3 bucket/prefix configured in `config.json`, then surface `needs_agent_review` rather than panicking or silently returning a partial list.
+
+**The fix is a code change, not a runtime override.** Because nothing is watching a scheduled Lambda invocation live, the old "wrapping agent reads the screenshot and resumes the same run" hand-off doesn't apply. Instead: the SNS/email notification (with the S3 screenshot link + DOM candidates) is reviewed later, the new selector is committed as a normal change to `internal/browser`, and the Lambda function is redeployed — the next scheduled invocation then uses the fixed selector. Do not build a runtime-read selector-override mechanism (e.g. an SSM parameter the handler consults) — that was considered and deliberately rejected in favor of keeping the fix as an ordinary, reviewable commit (see ADR-009).
 
 ## Judgment layer contract
 
-`skill/judgment.md` (not yet written) is read directly from this repo by the wrapping agent — it is not passed as an opaque embedded prompt. When creating/editing it, keep an explicit output contract: matched URL or none, confidence, one-line reason. The judgment layer must be able to say "no match" rather than forcing a pick when the true match is absent from the shortlist (prefilter is recall-biased, so this will happen).
+`skill/judgment.md` is embedded into the Lambda deployment package (e.g. via `go:embed`) and read by `internal/judge`, which calls the Claude API directly with the shortlist and these instructions as context — it is not an opaque hardcoded prompt string, and it is not invoked by an external wrapping agent anymore (see ADR-010). When creating/editing it, keep an explicit output contract: matched URL or none, confidence, one-line reason. The judgment layer must be able to say "no match" rather than forcing a pick when the true match is absent from the shortlist (prefilter is recall-biased, so this will happen). The verdict is recorded into the S3-backed price history within the same Lambda invocation — no separate `record-verdict` round trip from an external caller.
 
 ## Extensibility boundary (don't build until a second site is real)
 

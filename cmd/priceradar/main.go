@@ -1,5 +1,6 @@
-// Command priceradar is the one-shot CLI entrypoint for PriceRadar,
-// invoked by an OS-level scheduler (Windows Task Scheduler / cron).
+// Command priceradar is the Lambda handler entrypoint for PriceRadar,
+// invoked on a schedule by AWS EventBridge Scheduler (see ADR-006 in
+// docs/05-decisions.md).
 //
 // It is not yet wired up to the pipeline (fetch/parse/prefilter/store) —
 // that lands in later epics. This file currently only owns config.json's
