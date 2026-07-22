@@ -45,7 +45,7 @@ Keeps the parser dependency-free and simple for the common case. Accepts the kno
 ## ADR-003: Flat JSON file with atomic writes, no database
 
 ### Status
-Accepted — 2026-07-21
+Accepted — 2026-07-21. Superseded by ADR-007 (2026-07-22) — the storage *shape* (single JSON object, no database) is unchanged, but the backend moves from a local file to an S3 object.
 
 ### Context
 Price history for a single target device (or a handful of target specs) is small, low-write-frequency data (one run every few hours) with one reader/writer (the CLI, invoked by a scheduler). A database would add an operational dependency disproportionate to the data volume and access pattern.
@@ -61,7 +61,7 @@ Zero operational overhead (no server/service to run or back up beyond the file i
 ## ADR-004: OS-level scheduling driving a one-shot binary, not an in-process daemon
 
 ### Status
-Accepted — 2026-07-21
+Accepted — 2026-07-21. Superseded by ADR-006 (2026-07-22) — no always-on machine is available to host Task Scheduler/cron, so scheduling moves to AWS EventBridge Scheduler + Lambda.
 
 ### Context
 The pipeline runs infrequently (hours between runs) and has no need to hold state in memory between runs. An in-process scheduler (goroutine ticker, cron library) would require the binary to run continuously, adding a long-lived process to manage, restart on crash/reboot, and monitor.
@@ -77,7 +77,7 @@ Process lifecycle (start, crash recovery, reboot survival) is delegated to infra
 ## ADR-005: Three-way CLI exit-code contract (0/1/2)
 
 ### Status
-Accepted — 2026-07-21
+Accepted — 2026-07-21. Superseded by ADR-008 (2026-07-22) — the three-way *distinction* (success / hard error / needs-agent-review) is unchanged, but it's carried by a Lambda handler's `(response, error)` return value instead of a process exit code, since there's no invoking script left to inspect an exit code.
 
 ### Context
 The deterministic core can fail in two qualitatively different ways: an ordinary hard error (network failure, malformed config), or a specific, recoverable situation where the scraping mechanism itself may no longer match reality — the "Load more" selector isn't found. Collapsing both into a single non-zero exit code would force the invoking agent/scheduler to inspect output just to tell "something broke" from "something needs a judgment call about whether the site changed."
@@ -87,3 +87,89 @@ We will use a three-way exit-code contract for `cmd/priceradar`: `0` success (JS
 
 ### Consequences
 Callers (scheduler, wrapping agent) can branch on exit code alone without parsing output to distinguish "retry later" from "a human/agent needs to look at what the page looks like now." Adds a small amount of exit-code discipline that must be preserved anywhere `main()` is touched.
+
+---
+
+## ADR-006: AWS Lambda + EventBridge Scheduler, superseding OS-level scheduling
+
+### Status
+Accepted — 2026-07-22
+
+### Context
+ADR-004 assumed a machine that's on and reachable whenever the schedule fires (Windows Task Scheduler / cron). The maintainer doesn't have a machine kept on 24/7 for this, so that assumption doesn't hold in practice. The pipeline still runs infrequently (hours apart) and needs no in-memory state between runs, so a long-lived daemon is still not the right shape either. Separately, the maintainer wants AWS/cloud experience that's recognizable in the job market, which rules out a scheduler-as-code option like a CI cron job as the primary choice even though it would have been architecturally simpler (see the rejected GitHub Actions alternative below).
+
+### Decision
+We will run `cmd/priceradar` as an AWS Lambda function, invoked on a cron schedule by AWS EventBridge Scheduler, rather than relying on an OS-level scheduler driving a locally-running binary.
+
+### Alternatives considered
+- **GitHub Actions scheduled workflow:** would have preserved nearly the entire original architecture unchanged (flat-file storage via `git commit`, no S3/DynamoDB rewrite; trivial Chromium install via `apt-get` instead of a Lambda Layer; free). Rejected specifically because it doesn't build AWS/cloud skills the way Lambda does, which the maintainer prioritized over minimizing rework.
+- **A small always-on EC2/Fargate instance running the OS-scheduler approach unchanged:** rejected as needlessly costly (paying for idle compute between infrequent runs) compared to Lambda's pay-per-invocation model.
+
+### Consequences
+Removes the "needs a machine kept on" constraint entirely — the scheduler and compute are both managed AWS services. In exchange, several downstream assumptions that depended on "a process is always available to be invoked live" no longer hold and had to be redesigned: price-history storage moves off local disk (ADR-007), the CLI exit-code contract becomes a Lambda handler return-value contract (ADR-008), the selector-miss hand-off becomes asynchronous (ADR-009), and running chromedp requires a headless-Chromium Lambda Layer plus more careful memory/timeout tuning than a local Chrome install did. This is materially more AWS surface area to build and operate (IAM, S3, SNS, EventBridge, Lambda Layers) than the original single-binary design, accepted deliberately for the job-market rationale above.
+
+---
+
+## ADR-007: S3 object storage for price history, superseding local flat file
+
+### Status
+Accepted — 2026-07-22
+
+### Context
+ADR-003 established a local flat JSON file with atomic temp-file-plus-rename writes, appropriate for a single always-resident process with a persistent local filesystem. Moving to Lambda (ADR-006) removes both assumptions: Lambda's filesystem is ephemeral scratch space, not shared or persisted across invocations, so `price-history.json` needs to live somewhere durable that survives between scheduled runs.
+
+### Decision
+We will store price history as a single JSON object (same `map[string][]model.Snapshot]` shape, same `encoding/json` marshal/unmarshal logic) in an S3 bucket, read via `GetObject` and written back in full via `PutObject`, rather than as a local file with `os.Rename`-based atomic writes. DynamoDB (item-per-snapshot modeling) was considered and rejected for now — it would require a real rewrite of `internal/store`'s data shape for a dataset that stays small and low-write-frequency (one Lambda invocation every few hours), where the simplicity of "same JSON blob, different I/O backend" outweighs DynamoDB's better concurrent-write and query characteristics.
+
+### Consequences
+`internal/store`'s marshal/unmarshal logic and the `model.Snapshot` shape are unchanged — only the I/O calls change from file read/write to S3 `GetObject`/`PutObject`. A single whole-object `PutObject` is already atomic from any reader's perspective, so the local temp-file-plus-rename mechanic has no S3 equivalent to build — it simply isn't needed. Accepts a read-modify-write race if two invocations ever overlapped (not a concern today: EventBridge Scheduler invokes this Lambda on one non-overlapping schedule, so there is exactly one writer at a time by construction). If concurrent writers or richer querying become a real need later, that's the trigger to revisit DynamoDB, not a reason to build it now.
+
+---
+
+## ADR-008: Lambda handler return-value contract, superseding process exit codes
+
+### Status
+Accepted — 2026-07-22
+
+### Context
+ADR-005 established a three-way process exit-code contract (0/1/2) for a CLI invoked by a scheduler or a wrapping agent that could inspect the exit code directly. A Lambda function has no process exit code in that sense — the runtime contract is a Go handler returning `(response, error)`, and AWS's own retry/failure-destination machinery reacts to whether that `error` is `nil`, not to a numeric code.
+
+### Decision
+We will preserve the same three-way *distinction* (success / hard error / needs-agent-review) but carry it through the Lambda handler's return value instead of a process exit code: success returns `(Response{...}, nil)`; a hard error returns `(nil, err)` so Lambda records an invocation failure (letting EventBridge's retry policy and any on-failure destination react); `needs_agent_review` returns `(Response{status: "needs_agent_review", ...}, nil)` — deliberately a *successful* invocation, not an error, because retrying immediately cannot fix a broken selector and letting Lambda's automatic retries fire on it would just repeat the same miss.
+
+### Consequences
+The extracted, testable `run(...)` function pattern from the original CLI design (T7.1) carries over directly — it just returns `(Response, error)` instead of an `int` exit code, so unit tests still don't need to spawn a subprocess or a real Lambda runtime to exercise all three outcomes. The `needs_agent_review`-is-not-an-error choice means Lambda/EventBridge's built-in failure alerting does *not* cover this case automatically — the handler itself must publish the SNS notification for it (see ADR-009), rather than relying on an on-failure destination to do so.
+
+---
+
+## ADR-009: Asynchronous selector-miss hand-off (S3 screenshot + notify, fix via commit + redeploy)
+
+### Status
+Accepted — 2026-07-22
+
+### Context
+The original selector-miss design (ADR-001, ADR-005, and the PRD's FR4) assumed a wrapping Agent already running the CLI live against this repo, able to read the screenshot and resume the same run once it determined the fix. Moving to a scheduled Lambda (ADR-006) removes that assumption: nothing is watching a given invocation in real time, so the screenshot can't be read and acted on within the same run no matter where it's written.
+
+### Decision
+On selector miss, the handler uploads the screenshot to S3 and publishes an SNS/email notification containing the screenshot URL and DOM candidates, then returns successfully (see ADR-008) rather than blocking or erroring. The fix is delivered as an ordinary, reviewed code change to `internal/browser` (new selector/strategy), committed and redeployed — not a runtime-read override value (e.g. an SSM parameter or `selector-override.json` the handler consults each invocation). The next scheduled invocation then uses the fixed code. A runtime-read override was considered and rejected: it would mean the "fix" bypasses normal code review/versioning, adding a second, less-visible path for changing scraping behavior alongside the real one.
+
+### Consequences
+Accepts a real, unavoidable gap: from the moment a selector breaks until someone notices the alert and ships a fix, no new price data is collected for that run. This is inherent to removing "an agent is always watching live" and cannot be fully closed without paying for continuous live monitoring, which is out of scope for a personal tool. In exchange, the fix path stays simple and auditable — it's a normal commit, reviewable and revertible like any other change, rather than a second, harder-to-track configuration surface.
+
+---
+
+## ADR-010: Judgment layer calls the Claude API directly from the Lambda handler at runtime
+
+### Status
+Accepted — 2026-07-22
+
+### Context
+The original design (PRD FR8, Solution Architecture §4, and the "why not call an LLM API from inside Go" reasoning) deliberately kept judgment external: an already-running wrapping Agent would invoke the CLI, read the shortlist JSON from stdout, apply `skill/judgment.md` itself, and call back into a `record-verdict` subcommand. That design assumed the same thing ADR-009's original counterpart assumed — an agent already present and running the CLI live. On a scheduled Lambda, that agent isn't there for a routine run; if judgment stayed external, no run would ever be autonomous end-to-end — every invocation would produce a shortlist and then simply wait for someone to act on it, which defeats the goal of an unattended, scheduled price checker.
+
+### Decision
+`internal/judge` will call the Claude API directly (via `net/http`, no SDK) from inside the Lambda handler, synchronously within the same invocation, passing it the shortlist, relevant price history, and `skill/judgment.md`'s instructions (embedded via `go:embed`). The verdict is recorded into the S3-backed price history and acted on by `internal/notify` within that same invocation — no external round trip, no separate `record-verdict` caller. This intentionally narrows the original "no LLM calls inside the core" stance: it now applies to `httpclient`/`browser`/`parser`/`prefilter`/`store` specifically, not to the judgment layer, which was always meant to be the one place non-deterministic reasoning happens — only *how* it's invoked changes (in-process API call vs. external agent).
+
+Structure Verification (selector-miss, ADR-009) deliberately does **not** get the same treatment, and stays an async, human/agent-reviewed code change. The two hand-offs look similar on the surface (both are "the deterministic core hit something it can't decide") but differ in what kind of decision is being made: judgment is a bounded classification/scoring call over a small, well-defined input with a strict output contract, safe to automate and re-run every schedule; selector recovery means changing the actual scraping mechanism, which should go through the same review a code change normally would, not be auto-applied by an LLM call inside a running function.
+
+### Consequences
+The pipeline becomes autonomous end-to-end on a schedule, with no per-run human action required for the common case (which was a stated goal once there's no always-present agent to lean on). Adds a runtime dependency on Claude API availability and a secret to manage (the API key, via an SSM Parameter Store `SecureString`, read by `internal/judge`) — a hard Claude API failure during a run should be treated as this run's hard error path (ADR-008), not silently skipped. Also adds a small, ongoing API cost proportional to how often the shortlist is non-empty (bounded by the prefilter's 0–5-candidate output, per the original design's cost-proportionality goal). `skill/judgment.md` remains a plain file read directly from the repo (now embedded at build time rather than read from disk at invocation time), preserving the "instructions are inspectable/editable text, not a hardcoded prompt" property from the original design.

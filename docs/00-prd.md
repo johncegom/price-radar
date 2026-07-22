@@ -19,12 +19,12 @@ Each requirement is checkable against a specific epic/task in [Implementation Pl
 | FR1 | Fetch the initial listing batch over plain HTTPS, with a realistic User-Agent and retry/backoff on 429/5xx | E2 |
 | FR2 | Parse every product card into a structured record (name, price, original price, discount %, stock, URL), tolerating individual malformed cards without aborting the run | E3 |
 | FR3 | Fetch the *full* ~650-item catalog by driving the listing page's own "Load more" control (not just the first batch), selecting the control by visible text content, not CSS class | E4 |
-| FR4 | On selector miss, capture a screenshot and hand off to agent review rather than guessing or returning a silent partial list | E4 |
+| FR4 | On selector miss, capture a screenshot, upload it to S3, and notify (SNS/email) for later human/agent review rather than guessing, blocking on a live reviewer, or returning a silent partial list; the fix is delivered as a code commit + redeploy, not a runtime-read override | E4 |
 | FR5 | Deterministically narrow the full listing to a short list (0–5 candidates) of plausible matches for the target device, biased toward recall over precision | E5 |
-| FR6 | Persist every observation (price, discount, stock) to an append-only, timestamped history log per product URL, with atomic writes | E6 |
-| FR7 | Expose the pipeline as a one-shot CLI with a three-way exit contract: success (0, shortlist JSON), hard error (1, `{error,code}` JSON), needs-agent-review (2, structured JSON) | E7 |
-| FR8 | Let the judgment layer (an AI agent reading `skill/judgment.md` + the shortlist) decide match and notify-worthiness, including explicitly returning "no match" rather than forcing a pick, and record that verdict back through the CLI (`record-verdict`) rather than direct file edits | E7, E8 |
-| FR9 | Notify (log line, webhook, or chat message — channel decoupled from the decision) only when the judgment layer's verdict says so | E9 |
+| FR6 | Persist every observation (price, discount, stock) to an append-only, timestamped history log per product URL, stored as a single JSON object in S3 | E6 |
+| FR7 | Expose the pipeline as an AWS Lambda handler (invoked by EventBridge Scheduler) with a three-way outcome contract: success (`(Response, nil)`, shortlist JSON), hard error (`(nil, err)`, Lambda invocation error), needs-agent-review (`(Response{status:"needs_agent_review"}, nil)`, structured JSON, deliberately not an invocation error) | E7 |
+| FR8 | Let the judgment layer — `internal/judge`, calling the Claude API directly with `skill/judgment.md` + the shortlist, within the same Lambda invocation — decide match and notify-worthiness, including explicitly returning "no match" rather than forcing a pick, and record that verdict into the S3-backed price history in-process (no external round trip / no separate `record-verdict` caller) | E7, E8 |
+| FR9 | Notify (log line, SNS/email, or chat message — channel decoupled from the decision) only when the judgment layer's verdict says so | E9 |
 
 ## Non-goals (v1)
 
@@ -33,8 +33,9 @@ These are hard boundaries, not soft defaults — an agent must not silently cros
 - No scraping of other retailers or categories — one site, one page, one target spec.
 - No login, checkout, or purchase automation.
 - No filtered/query-parameter scraping and no reliance on the site's undocumented internal API (`robots.txt`-disallowed).
-- No continuous/real-time polling — scheduled, low-frequency checks only.
-- No third-party HTTP framework, no third-party HTML parser by default, no LLM calls inside the deterministic core (`chromedp` is the one sanctioned dependency, scoped to `internal/browser`).
+- No continuous/real-time polling — scheduled (EventBridge Scheduler), low-frequency checks only.
+- No third-party HTTP framework, no third-party HTML parser by default, no LLM calls inside `httpclient`/`browser`/`parser`/`prefilter`/`store` (`chromedp` is the one sanctioned scraping dependency, scoped to `internal/browser`; `aws-sdk-go-v2` and `aws-lambda-go` are the sanctioned AWS-integration dependencies). The judgment layer (`internal/judge`) *does* call the Claude API at runtime by design — see ADR-010 — that exception is scoped to judgment only and does not extend to the deterministic stages.
+- No runtime-read selector-override mechanism for selector-miss recovery — the fix is always a reviewed code commit + redeploy (see ADR-009).
 - No MCP extension or second-site support in v1 — both are explicitly deferred (E11, E12 in the Implementation Plan), trigger-based, not scheduled work.
 
 ## Constraints
@@ -44,10 +45,10 @@ Tech-stack, compliance, and selector-strategy constraints are enforced in `CLAUD
 ## Acceptance criteria for "v1 done"
 
 Tied to the Implementation Plan's E10 (hardening epic):
-- `go test ./...` passes across all packages.
-- All three CLI exit codes (0/1/2) are reachable on demand and match the documented JSON shape exactly.
+- `go test ./...` passes across all packages, without requiring AWS credentials or a deployed Lambda function.
+- All three Lambda handler outcomes (success / hard error / `needs_agent_review`) are reachable on demand (local invocation of the extracted `run(...)` function) and match the documented JSON shape exactly.
 - No code path ever constructs a disallowed URL (filtered query params, `/ajax/`, the internal API).
-- The judgment round trip — CLI shortlist JSON → `skill/judgment.md` applied → `record-verdict` → `price-history.json` updated — is demonstrated end-to-end at least once.
+- The judgment round trip — shortlist → `internal/judge` calls the Claude API with `skill/judgment.md` → verdict recorded into the S3-backed price history — is demonstrated end-to-end at least once within a single handler invocation.
 
 ## Change control
 

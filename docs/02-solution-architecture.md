@@ -17,15 +17,15 @@ This keeps the expensive/non-deterministic part (an LLM call) proportional to ac
 
 ```mermaid
 flowchart LR
-    A[Scheduler] --> B[Fetch]
-    B -.selector miss.-> SV[Structure Verification\nAgent]
-    SV -.resume w/ override.-> B
+    A[EventBridge Scheduler] --> B[Fetch]
+    B -.selector miss: S3 screenshot + notify.-> SV[Structure Verification\nhuman/agent, async]
+    SV -.commit fix + redeploy, next scheduled run.-> A
     B --> C[Parse]
     C --> D[Deterministic Prefilter]
-    D -->|shortlist: 0-5 candidates| E[Agent Judgment]
-    D -->|full listing count| F[Price History Store]
+    D -->|shortlist: 0-5 candidates| E[Judgment\nClaude API call, in-process]
+    D -->|full listing count| F[Price History Store\nS3]
     E --> F
-    E --> G[Notify]
+    E --> G[Notify\nSNS/log]
 ```
 
 ### 1. Fetch
@@ -33,12 +33,14 @@ Two parts, because the listing page has no URL-based pagination (confirmed empir
 - The initial batch is a plain HTTP GET against the clean listing URL. Sends a realistic User-Agent, retries with exponential backoff on 429/5xx. Never requests the filtered/query-parameter URLs `robots.txt` disallows.
 - The remaining ~627 items are only reachable by repeatedly triggering the page's own client-side "Load more" control, so Fetch drives a headless browser (chromedp) against the same permitted URL, clicking until the control is exhausted. See [System Architecture § Browser Automation](03-system-architecture.md#internalbrowser) for why this, and not the site's internal API or filtered-URL scraping, was chosen.
 
-### 1a. Structure Verification (Agent touchpoint, mechanical)
-If the "Load more" control can't be located by its primary (text-content-based) selector, Fetch does not guess or fail hard — it captures a screenshot of the current page state, writes it to disk, and exits with a distinct `needs_agent_review` status (see [System Architecture § CLI contract](03-system-architecture.md#cmdpriceradar-one-shot-cli)). The wrapping Agent — already running the CLI directly against this repo (see the project README) — reads the screenshot, determines the correct selector or next action, and resumes the run.
+### 1a. Structure Verification (Agent touchpoint, mechanical, asynchronous)
+If the "Load more" control can't be located by its primary (text-content-based) selector, Fetch does not guess or fail hard — it captures a screenshot of the current page state, uploads it to S3, publishes an SNS/email notification with the screenshot link and DOM candidates, and returns a distinct `needs_agent_review` result (see [System Architecture § Lambda handler contract](03-system-architecture.md#cmdpriceradar-lambda-handler)).
 
-This is a **different kind of judgment** than step 4 below: it's about whether the scraping mechanism itself still matches reality (mechanical/structural), not about the business question of which product matches the target. Both share the same shape — Go emits a structured "I can't decide this deterministically" signal, the Agent (with repo/file access, not a live API call from inside Go) resolves it, then hands control back — but they sit at different points in the pipeline and answer different questions.
+Since the pipeline now runs as a scheduled Lambda invocation with no one watching it live, this hand-off is **asynchronous, not same-run**: a human or an agent session reviews the notification later, decides the correct selector, and commits that fix directly to `internal/browser` — the fix ships on the *next* Lambda deployment, not by resuming the run that hit the miss. This is a deliberate change from the original design (where an always-present wrapping agent could read the screenshot and resume within the same run) — see ADR-009 for the reasoning and the accepted trade-off (a selector break now costs however long it takes someone to notice the alert and ship a fix, not zero).
 
-A future, formalized version of this hand-off is planned as an MCP tool (`verify_page_structure`) once the [MCP Extension](#extension-point-mcp) exists — not built now, since the exit-code/JSON hand-off already works and MCP is itself deferred.
+This is a **different kind of judgment** than step 4 below: it's about whether the scraping mechanism itself still matches reality (mechanical/structural), not about the business question of which product matches the target. It's also, deliberately, **not** handled the same way step 4 now is — Structure Verification stays a human-reviewed code change, not a runtime API call, because "what's the new stable selector" is a scraping-code decision, not a judgment an LLM API call is well-placed to make reliably or safely apply. See ADR-010 for why judgment (step 4) moved to a runtime API call while this did not.
+
+A future, formalized version of this hand-off is planned as an MCP tool (`verify_page_structure`) once the [MCP Extension](#extension-point-mcp) exists — not built now, since the S3+notification hand-off already works and MCP is itself deferred.
 
 ### 2. Parse
 Turns raw HTML into a list of `Product` records: name, current price, original price, discount %, stock indicator, product URL. Parsing is per-card and fault-isolated — one malformed card doesn't abort the run, since the target page is server-rendered (no JS execution required).
@@ -51,18 +53,18 @@ Cheap token-overlap scoring narrows the full listing (~650 items) down to a shor
 Output per candidate: name, price, discount, stock, URL, overlap score, matched/missing tokens.
 
 ### 4. Agent Judgment
-Given the short list, the price history for any already-tracked candidate URL, and a written instructions file (matching rules + notify rules), the agent:
+`internal/judge` calls the Claude API directly — synchronously, within the same Lambda invocation — with the short list, the price history for any already-tracked candidate URL, and `skill/judgment.md`'s instructions (matching rules + notify rules). The response:
 - Decides which candidate (if any) is genuinely the target device.
 - Decides whether the current price/discount/trend is worth flagging.
 - Produces a verdict with a stated reason, so decisions stay auditable even though they aren't hardcoded.
 
-Only the short list (typically 0–5 items) is ever handed to the agent — not the full catalog — to keep latency and cost proportional to actual ambiguity.
+Only the short list (typically 0–5 items) is ever handed to judgment — not the full catalog — to keep latency and cost proportional to actual ambiguity. This is now a live runtime API call rather than an external agent invoking the CLI and reporting back — see ADR-010 for why that changed and why it's safe: the shortlist is always small and bounded, the call sits after prefiltering (not inside it), and a "no match" response is always a valid, expected outcome.
 
 ### 5. Price History Store
-An append-only, timestamped log of every observation per product URL (price, discount, stock), regardless of whether the agent judged it a match this run. This is a **history log, not a dedup filter** — the goal is visibility into price trend over time, not "seen once, skip."
+An append-only, timestamped log of every observation per product URL (price, discount, stock), regardless of whether judgment found it a match this run. This is a **history log, not a dedup filter** — the goal is visibility into price trend over time, not "seen once, skip." Stored as a single JSON object in S3 (see [System Architecture § Storage](03-system-architecture.md#internalstore)).
 
 ### 6. Notify
-Fires only when the agent's judgment says so (new match, price drop, price below threshold). Delivery channel is decoupled from the decision — a log line, a webhook post, or a chat message are equally valid.
+Fires only when judgment's verdict says so (new match, price drop, price below threshold). Delivery channel is decoupled from the decision — a log line, an SNS/email notification, or a chat message are equally valid.
 
 ## Extension point: MCP
 The same deterministic core (fetch → parse → prefilter → store) can be exposed as an MCP server in addition to running as a scheduled one-shot batch job, so any MCP-capable agent host can call it interactively rather than only on a timer. This is additive — it does not change the pipeline above, only how it's invoked. See [System Architecture § MCP Extension](03-system-architecture.md#6-mcp-extension-optional) for the concrete shape. The Structure Verification hand-off (§1a above) is expected to become one of these MCP tools eventually (`verify_page_structure`) — deferred alongside the rest of the MCP extension, not built now.
@@ -71,7 +73,7 @@ The same deterministic core (fetch → parse → prefilter → store) can be exp
 - **Why not one Go program that also decides notify?** — Because "does this listing match a loosely-specified target" and "is this price worth flagging" are exactly the kind of judgment calls that break brittle regex/threshold rules whenever the site's naming conventions shift slightly. A hard rule set has to be exhaustively pre-anticipated; an agent given clear instructions can adapt without new code being shipped.
 - **Why not run the agent over every listing?** — Cost and latency scale with catalog size for no benefit; the prefilter already does the "is this even plausible" work cheaply and deterministically.
 - **Why keep history append-only rather than dedup?** — The point of a price *checker* is the trend, not just presence/absence.
-- **Why hand Structure Verification back to the wrapping Agent instead of calling an LLM API from inside Go?** — The CLI is already designed to be run by an Agent with direct access to this repo (see the project README's Usage section). Reusing that existing hand-off — Go emits a structured signal and exits, the Agent reads a file and resumes — needs zero new dependencies (no API client, no key management) inside the deterministic core. A live in-process API call was considered and rejected for now: it would duplicate a channel that already exists.
+- **Why call the Claude API in-process for Judgment but not for Structure Verification?** — Judgment (step 4) is a bounded, low-stakes text-classification task over a small shortlist, well-suited to a single API call with a clear output contract, and it needs to run unattended on every scheduled invocation for the pipeline to be autonomous end-to-end (see ADR-010). Structure Verification is a different kind of problem: recovering from it means changing scraping code (a new selector, a new DOM strategy), which is a decision that should be reviewed and committed like any other code change — not something to have an LLM call "fix" live inside a running Lambda invocation. So that hand-off stays asynchronous and human/agent-reviewed (screenshot to S3, notify, fix via commit + redeploy — see ADR-009), even though judgment itself moved to a live runtime call.
 
 ## Future extensibility (not built yet)
 
