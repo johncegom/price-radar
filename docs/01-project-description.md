@@ -6,10 +6,10 @@ A personal Go program that checks whether a specific device (e.g. **MacBook Pro 
 ## Why
 - Manually re-checking a listing page for one specific device is tedious and easy to forget.
 - The target page's initial batch is server-rendered and publicly accessible, so most of the pipeline can run mechanically without a login. Seeing the *full* ~650-item catalog does require driving the page's own "Load more" control (see [Compliance posture](#compliance-posture) below) — there's no URL-based pagination to fetch instead.
-- The project doubles as a **testbed for high-autonomy AI agent development**: a small, real, end-to-end system (HTTP client → parser → storage → decision logic) built and driven by AI agents operating directly against this repo, that can grow in scope as agent autonomy and coordination patterns (single agent → agent swarm) are explored.
+- The project doubles as a **testbed for high-autonomy AI agent development**: a small, real, end-to-end system (HTTP client → parser → storage → decision logic) built and driven by AI agents operating directly against this repo, that can grow in scope as agent autonomy and coordination patterns (single agent → agent swarm) are explored. This is also why an on-demand local trigger matters early: an agent working in this repo can run the real pipeline directly and see all three outcomes without needing AWS deployed first.
 
 ## What it does
-1. Fetches the listing page(s) on a schedule (not continuously).
+1. Fetches the listing page(s) on a schedule (EventBridge Scheduler, once deployed) or on demand — locally today, and later via an MCP interactive trigger once deployed — never continuously.
 2. Parses out every product card (name, price, discount, stock).
 3. Deterministically narrows ~650+ listings down to a short list of plausible matches for the target device.
 4. Judges the short list against the target spec and price/notify criteria — first with simple rules, later with an AI agent layer for ambiguous naming and "is this worth flagging" judgment.

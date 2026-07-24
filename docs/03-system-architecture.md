@@ -8,16 +8,16 @@ Concrete tech stack and structure. Companion to [Solution Architecture](02-solut
 - **Browser automation:** [`chromedp`](https://github.com/chromedp/chromedp) — a deliberate, scoped exception to the zero-third-party-dependency stance. Needed because the listing's full ~650-item catalog has no URL-based pagination (verified empirically — `?trang=`, `?page=`, `?p=` all return the identical first batch) and no compliant alternative: the site's internal API (`papi.fptshop.com.vn`) is undocumented and unstable, and the filtered/query-parameter URLs that would otherwise narrow results are explicitly disallowed by `robots.txt`. Driving the page's own "Load more" control via chromedp fetches the same permitted URL a real user would, just automated. Chosen over `go-rod` and `playwright-go` for largest community + most active maintenance + no separate driver-install step (pure Go, CDP-based, only needs a Chrome/Chromium binary — see Lambda packaging below for how that binary gets into the execution environment).
 - **AWS integration:** `aws-sdk-go-v2` (S3 + SNS clients only) and `aws-lambda-go` (the Lambda runtime shim) — sanctioned, narrowly-scoped dependencies for the deployment target, same treatment as chromedp: justified by a concrete requirement (S3 object storage, SNS notifications, Lambda's handler contract), not a general license for more AWS SDK usage.
 - **Judgment-layer LLM calls:** the Claude API (Messages endpoint), called directly via `net/http` from `internal/judge` — no SDK, since it's a single request/response call with no streaming need. Scoped to that one package; see ADR-010.
-- **Storage:** `encoding/json`, one JSON object, no database — the object lives in S3 instead of on local disk (see ADR-007).
-- **Scheduling:** AWS EventBridge Scheduler invoking the Lambda function on a cron expression, not an in-process daemon and not an OS-level scheduler (see ADR-006 — this supersedes the original OS-scheduler decision because there's no always-on machine to host Task Scheduler/cron).
+- **Storage:** `encoding/json`, one JSON object, no database — the object lives in S3 once configured, with a local-file fallback for pre-deployment on-demand use (see ADR-007, ADR-011) instead of on local disk always.
+- **Scheduling:** AWS EventBridge Scheduler invoking the Lambda function on a cron expression, not an in-process daemon and not an OS-level scheduler (see ADR-006 — this supersedes the original OS-scheduler decision because there's no always-on machine to host Task Scheduler/cron). Alongside this, `cmd/priceradar` also supports a first-class on-demand local trigger mode, usable pre-deployment (see ADR-011).
 
 ## Module layout
 
 ```
 priceradar/
   cmd/
-    priceradar/            # Lambda handler entrypoint (default, EventBridge Scheduler-invoked)
-      main.go                 # lambda.Start(handler) wrapper; handler logic extracted into a plain, locally-testable run()
+    priceradar/            # dual-mode entrypoint: Lambda handler (EventBridge-invoked) when deployed, on-demand local trigger otherwise
+      main.go                 # detects AWS_LAMBDA_RUNTIME_API; lambda.Start(handler) if present, else runs run(ctx, cfg) once and reports Response/error via stdout/exit code
     priceradar-mcp/         # optional MCP server entrypoint (extension)
       main.go
   internal/
@@ -60,8 +60,8 @@ priceradar/
 
 ### `internal/notify`
 - Fires only when `internal/judge`'s verdict says so (new match, price drop, price below threshold).
-- Default channel: a structured log line (visible in CloudWatch Logs, zero additional config). AWS-native channel: publish to an SNS topic (ARN from `config.json`) for email/SMS/webhook fan-out via SNS subscriptions.
-- Also the channel used for the selector-miss alert from `internal/browser` (same SNS topic, different message shape) — see ADR-009.
+- Default channel: a structured log line (visible in CloudWatch Logs, or plain stdout/stderr locally — zero additional config). AWS-native channel: publish to an SNS topic (ARN from `config.json`) for email/SMS/webhook fan-out via SNS subscriptions, only attempted when `config.json` has an SNS topic ARN configured — pre-deployment on-demand runs with no ARN configured skip the SNS publish and rely on the log line alone.
+- Also the channel used for the selector-miss alert from `internal/browser` (same SNS topic, different message shape, same config-presence gating) — see ADR-009. This behavior is identical regardless of trigger mode: `internal/browser` never branches on how the run was triggered, only `internal/notify` branches on whether an SNS topic is configured.
 
 ### `internal/parser`
 - Per-product-card regex extraction into `model.Product{Name, URL, Price, OriginalPrice, DiscountPct, InStock, FetchedAt}`.
@@ -74,22 +74,54 @@ priceradar/
 - Output: `model.Candidate{Product, Score, MatchedTokens, MissingTokens}`.
 
 ### `internal/store`
-- `map[string][]model.Snapshot]` keyed by product URL, `encoding/json` marshal/unmarshal — same shape as the original design.
-- Backed by a single S3 object (bucket/key from `config.json`): `GetObject` the current history (missing key → empty map, not an error), append new snapshots in memory, `PutObject` the whole object back.
-- No temp-file/`os.Rename` dance to replicate — S3 already serves either the old or the new object to any reader, never a partial write, so a whole-object `PutObject` is already atomic from a reader's perspective (see ADR-007). This does mean two concurrent invocations could race (read-modify-write), which is accepted because EventBridge Scheduler invokes this Lambda on a single non-overlapping schedule — there is exactly one writer at a time by construction.
+- `map[string][]model.Snapshot]` keyed by product URL, `encoding/json` marshal/unmarshal — same shape as the original design, shared by both backends below.
+- **Backend selection (config-presence-driven, not trigger-mode-driven):** if `config.json` has an S3 bucket/key configured, use the S3 backend; if not (pre-deployment, on-demand local use), fall back to a local JSON file (e.g. `./price-history.local.json`) with the same read-append-write shape. Both the on-demand local trigger and the scheduled Lambda call the same `internal/store` interface — only which backend is live depends on whether `config.json`'s S3 fields are populated, never on which trigger invoked the run.
+- **S3 backend:** backed by a single S3 object (bucket/key from `config.json`): `GetObject` the current history (missing key → empty map, not an error), append new snapshots in memory, `PutObject` the whole object back — protected by a conditional-write retry loop (below), not a bare overwrite.
+- **Local-file backend:** `os.ReadFile`/`os.WriteFile` against the configured local path, same JSON shape; no concurrency protection needed since this mode implies a single machine, single process (pre-deployment, no scheduled Lambda coexists with it yet).
+- No temp-file/`os.Rename` dance to replicate for the S3 backend — S3 already serves either the old or the new object to any reader, never a partial write, so a whole-object `PutObject` is already atomic *per write* from a reader's perspective (see ADR-007). That said, a bare read-modify-write is unsafe once more than one invocation can run at overlapping times — which is now possible once an on-demand local trigger runs against real S3 alongside the scheduled Lambda (ADR-011) — so S3 writes use a conditional-write retry loop instead of a bare `PutObject` (see ADR-012):
 
-### `cmd/priceradar` (Lambda handler)
-Straight-line handler logic, no goroutines required for a single-page run — but the core logic is extracted into a plain `run(ctx, cfg) (Response, error)` function so it's testable without spinning up a Lambda runtime, and `main.go` is a thin `lambda.Start(handler)` wrapper around it:
-1. Load `config.json` (bundled into the deployment package).
+**Conditional-write retry loop (S3 backend only):**
+1. `GetObject` the current history object, capturing its response `ETag` (missing key → treat as empty map with no ETag/"create" precondition).
+2. Apply the in-memory append (new snapshot(s) + verdict) to the fetched object.
+3. `PutObject` the updated object with a precondition tied to the ETag just read:
+   - If an existing object was read: set the `If-Match` header to that ETag (S3 conditional write — rejects the write with an HTTP 412 Precondition Failed if the object changed since the read).
+   - If no object existed (first run): set `If-None-Match: *` so the write only succeeds if the key is still absent (guards against two first-ever-runs racing to create the object).
+4. On `412 Precondition Failed`: another writer updated the object between this writer's read and write. Retry from step 1 (re-`GetObject`, re-apply the append to the *new* current state, re-`PutObject` with the new ETag) — never blindly overwrite with stale data.
+5. **Bounded retries with backoff:** cap at a small fixed number of attempts (e.g. 5), with a short exponential backoff between attempts (e.g. 100ms, 200ms, 400ms...) — this is a single-user personal tool with at most two writers in practice (one scheduled Lambda run, one on-demand local run), not a high-contention system, so a small bound is sufficient and avoids unbounded retry storms.
+6. **On exhausted retries:** the write function returns an error to the caller (the handler/`run(ctx, cfg)`), which surfaces it through the existing hard-error path — `(nil, err)` (Lambda) / exit `1` (on-demand local) — per ADR-008. This is a deliberate choice not to silently drop the snapshot or silently proceed without persisting: losing an observation from the append-only history is treated as a real failure, not a best-effort miss.
+- **No new dependency:** S3 conditional writes (`If-Match`/`If-None-Match` on `PutObject`) are a standard `aws-sdk-go-v2` S3 client feature (`PutObjectInput.IfMatch`/`IfNoneMatch` fields), not a new library or a DynamoDB locking table — deliberately the smallest mechanism that closes the race, appropriate for a single-user tool with at most two concurrent writers, not a distributed-systems-scale solution.
+
+### `cmd/priceradar` (dual-mode entrypoint: Lambda handler + on-demand local trigger)
+Straight-line handler logic, no goroutines required for a single-page run — but the core logic is extracted into a plain `run(ctx, cfg) (Response, error)` function so it's testable without spinning up a Lambda runtime, and reusable from either invocation mode:
+1. Load `config.json` (bundled into the deployment package, or read from the working directory for on-demand local runs).
 2. Fetch initial batch (`httpclient`) + drive `browser` to load the full catalog.
 3. Parse the resulting HTML.
 4. Prefilter → shortlist.
 5. Judgment (`internal/judge` calls the Claude API with the shortlist) → verdict.
-6. Append new snapshots (and the verdict) to the S3-backed price history (`internal/store`).
+6. Append new snapshots (and the verdict) to the price history (`internal/store`, S3 or local-file backend per config).
 7. Notify (`internal/notify`) if the verdict says so.
 8. Return the response.
 
-**Handler outcome contract** — a three-way outcome, not just success/failure, adapted from the original CLI exit-code design to Lambda's `(response, error)` shape:
+**Mode selection (`main()`):** `main()` itself contains only this dispatch, no pipeline logic:
+
+```go
+func main() {
+    if os.Getenv("AWS_LAMBDA_RUNTIME_API") != "" {
+        lambda.Start(handler) // handler wraps run(ctx, cfg)
+    } else {
+        runOnDemand()
+    }
+}
+```
+
+- **Detection:** presence of the `AWS_LAMBDA_RUNTIME_API` environment variable, which the Lambda runtime sets automatically and which is never set in a normal local/dev shell — this is the standard way Go Lambda binaries distinguish "running under the Lambda runtime" from "running as a plain binary," so no new sentinel/flag is introduced.
+- **On-demand local path (`runOnDemand`):** loads `config.json` exactly as the Lambda path does (same loader, same file), calls `run(ctx, cfg)` once with a bounded `context.Context`, then:
+  - On `(Response, nil)` (success or `needs_agent_review`): marshal `Response` to JSON, write it to stdout, exit `0`.
+  - On `(nil, err)`: write `{"error": err.Error()}` to stderr, exit `1`.
+- **No new outcome contract:** this reuses ADR-008's exact three states — the only difference from the Lambda path is *how* the outcome is surfaced (stdout/exit code vs. Lambda's `(response, error)` return value), mirroring how ADR-008 itself adapted ADR-005's exit-code contract to Lambda's return-value shape without changing the underlying three-way distinction.
+- **Config/credentials pre-deployment:** the on-demand path does not stub or skip the real pipeline — it runs the real `run(ctx, cfg)`. `internal/store`/`internal/notify` fall back to local-file storage / log-only notify when `config.json`'s S3/SNS fields are absent (see `internal/store`/`internal/notify` above and ADR-011), so a real success/hard-error/`needs_agent_review` outcome is reachable without any AWS resources provisioned yet. If S3/SNS *are* configured (post-provisioning, pre- or post-Lambda-deployment), the on-demand path uses them via the standard AWS SDK credential chain (e.g. a local `~/.aws/credentials` profile), same as the eventual Lambda execution role would.
+
+**Handler outcome contract** — a three-way outcome, not just success/failure, adapted from the original CLI exit-code design to Lambda's `(response, error)` shape (and, per ADR-011, reused verbatim by the on-demand local path via stdout/exit-code):
 
 | Outcome | Handler return | Meaning |
 |---|---|---|
@@ -133,14 +165,21 @@ flowchart TB
         L -->|judgment call| Claude[Claude API]
     end
     L -->|HTTPS GET, chromedp via Lambda Layer| Site[fptshop.com.vn/may-doi-tra]
+    subgraph Local, pre-deployment
+        Dev[Developer/agent shell] -.on-demand: go run ./cmd/priceradar.-> BinLocal[priceradar binary, non-Lambda mode]
+    end
+    BinLocal -.S3 if configured, else local file.-> S3H
+    BinLocal -.SNS if configured, else log only.-> SNS
+    BinLocal -->|judgment call| Claude
+    BinLocal -->|HTTPS GET, chromedp| Site
     subgraph Local / wherever an agent host runs
-        Host[MCP-capable agent host] -.optional interactive path, independent of the Lambda.-> MCP[priceradar-mcp]
+        Host[MCP-capable agent host] -.optional interactive path, independent of the Lambda, post-deployment.-> MCP[priceradar-mcp]
     end
     MCP -.reads/writes.-> S3H
     MCP -->|HTTPS GET| Site
 ```
 
-The scheduled Lambda path and the optional interactive MCP path share the same `internal/*` core and the same S3-backed price history — two doors into one system, not two systems — but only the Lambda path runs on a schedule; MCP is invoked on demand by whatever host is running it.
+Three doors into one system, not three systems — all share the same `internal/*` core and the same price history store: the scheduled Lambda path (production, once deployed), the on-demand local trigger (available now, pre-deployment — `cmd/priceradar` run directly), and the interactive MCP path (deferred until post-deployment, then the intended production on-demand door). Because more than one of these can write to the same S3-backed store at overlapping times once real S3 is in use, `internal/store`'s conditional-write retry loop (see `internal/store` above, ADR-012) is what keeps concurrent writes safe, not scheduling exclusivity.
 
 ## Future extensibility: where a second site would plug in (not built yet)
 
