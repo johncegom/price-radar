@@ -1,0 +1,116 @@
+<!--
+Synthetic fixture approximating the fptshop.com.vn/may-doi-tra listing markup.
+
+IMPORTANT (open question for E4/a human to reconcile): this is NOT scraped
+from the live site. Nobody on this task has seen the real card markup, so
+the class names, attribute names, and Vietnamese stock-status text below
+("Con hang" / "Het hang") are a plausible best guess at the *shape* of a
+product-card grid (name / link / current+original price / discount badge /
+stock indicator), not a verified match to FPT Shop's actual DOM. When E4
+(browser fetch) or a human pulls real HTML from the site, internal/parser's
+regexes in parser.go will very likely need to be adjusted to match the real
+selectors/attributes/text — treat this fixture as a structural placeholder,
+not ground truth.
+
+Card 1 (below) is the "golden" card whose exact field values the parser
+test asserts against.
+-->
+<!DOCTYPE html>
+<html lang="vi">
+<head><meta charset="utf-8"><title>May doi tra - FPT Shop</title></head>
+<body>
+<div class="listing-container">
+
+  <!-- Card 1: in-stock, discounted -- golden values card -->
+  <div class="product-card" data-product-id="1001">
+    <a class="product-link" href="https://fptshop.com.vn/may-doi-tra/macbook-pro-m2-pro-32gb-512gb">
+      <img src="/img/macbook-pro-m2-pro.jpg" alt="MacBook Pro M2 Pro 32GB/512GB">
+      <h3 class="product-name">MacBook Pro M2 Pro 32GB/512GB</h3>
+      <div class="price-box">
+        <span class="price-current">45.990.000₫</span>
+        <span class="price-original">52.990.000₫</span>
+        <span class="discount-badge">-13%</span>
+      </div>
+      <div class="stock-status in-stock">Con hang</div>
+    </a>
+  </div>
+
+  <!-- Card 2: in-stock, no discount -->
+  <div class="product-card" data-product-id="1002">
+    <a class="product-link" href="https://fptshop.com.vn/may-doi-tra/ipad-air-5-64gb">
+      <img src="/img/ipad-air-5.jpg" alt="iPad Air 5 64GB">
+      <h3 class="product-name">iPad Air 5 64GB</h3>
+      <div class="price-box">
+        <span class="price-current">12.490.000₫</span>
+      </div>
+      <div class="stock-status in-stock">Con hang</div>
+    </a>
+  </div>
+
+  <!-- Card 3: out-of-stock, discounted -->
+  <div class="product-card" data-product-id="1003">
+    <a class="product-link" href="https://fptshop.com.vn/may-doi-tra/macbook-air-m1-8gb-256gb">
+      <img src="/img/macbook-air-m1.jpg" alt="MacBook Air M1 8GB/256GB">
+      <h3 class="product-name">MacBook Air M1 8GB/256GB</h3>
+      <div class="price-box">
+        <span class="price-current">18.990.000₫</span>
+        <span class="price-original">21.990.000₫</span>
+        <span class="discount-badge">-14%</span>
+      </div>
+      <div class="stock-status out-of-stock">Het hang</div>
+    </a>
+  </div>
+
+  <!-- Card 4: out-of-stock, no discount -->
+  <div class="product-card" data-product-id="1004">
+    <a class="product-link" href="https://fptshop.com.vn/may-doi-tra/iphone-13-128gb">
+      <img src="/img/iphone-13.jpg" alt="iPhone 13 128GB">
+      <h3 class="product-name">iPhone 13 128GB</h3>
+      <div class="price-box">
+        <span class="price-current">14.290.000₫</span>
+      </div>
+      <div class="stock-status out-of-stock">Het hang</div>
+    </a>
+  </div>
+
+  <!-- Card 5: MALFORMED - price-current span entirely missing, broken/unclosed img tag.
+       Must be skipped (logged) without aborting the rest of the parse. -->
+  <div class="product-card" data-product-id="1005">
+    <a class="product-link" href="https://fptshop.com.vn/may-doi-tra/broken-card">
+      <img src="/img/broken.jpg" alt="Broken card"
+      <h3 class="product-name">Dell XPS 13 (no price)</h3>
+      <div class="price-box">
+      </div>
+      <div class="stock-status in-stock">Con hang</div>
+    </a>
+  </div>
+
+  <!-- Card 6: MALFORMED - empty product name. Must also be skipped. -->
+  <div class="product-card" data-product-id="1006">
+    <a class="product-link" href="https://fptshop.com.vn/may-doi-tra/nameless-card">
+      <img src="/img/nameless.jpg" alt="">
+      <h3 class="product-name"></h3>
+      <div class="price-box">
+        <span class="price-current">9.990.000₫</span>
+      </div>
+      <div class="stock-status in-stock">Con hang</div>
+    </a>
+  </div>
+
+  <!-- Card 7: in-stock, discounted, last card (tests end-of-listing boundary) -->
+  <div class="product-card" data-product-id="1007">
+    <a class="product-link" href="https://fptshop.com.vn/may-doi-tra/macbook-pro-m3-16gb-512gb">
+      <img src="/img/macbook-pro-m3.jpg" alt="MacBook Pro M3 16GB/512GB">
+      <h3 class="product-name">MacBook Pro M3 16GB/512GB</h3>
+      <div class="price-box">
+        <span class="price-current">38.490.000₫</span>
+        <span class="price-original">40.990.000₫</span>
+        <span class="discount-badge">-6%</span>
+      </div>
+      <div class="stock-status in-stock">Con hang</div>
+    </a>
+  </div>
+
+</div>
+</body>
+</html>
