@@ -21,10 +21,11 @@ Each requirement is checkable against a specific epic/task in [Implementation Pl
 | FR3 | Fetch the *full* ~650-item catalog by driving the listing page's own "Load more" control (not just the first batch), selecting the control by visible text content, not CSS class | E4 |
 | FR4 | On selector miss, capture a screenshot, upload it to S3, and notify (SNS/email) for later human/agent review rather than guessing, blocking on a live reviewer, or returning a silent partial list; the fix is delivered as a code commit + redeploy, not a runtime-read override | E4 |
 | FR5 | Deterministically narrow the full listing to a short list (0–5 candidates) of plausible matches for the target device, biased toward recall over precision | E5 |
-| FR6 | Persist every observation (price, discount, stock) to an append-only, timestamped history log per product URL, stored as a single JSON object in S3 | E6 |
-| FR7 | Expose the pipeline as an AWS Lambda handler (invoked by EventBridge Scheduler) with a three-way outcome contract: success (`(Response, nil)`, shortlist JSON), hard error (`(nil, err)`, Lambda invocation error), needs-agent-review (`(Response{status:"needs_agent_review"}, nil)`, structured JSON, deliberately not an invocation error) | E7 |
-| FR8 | Let the judgment layer — `internal/judge`, calling the Claude API directly with `skill/judgment.md` + the shortlist, within the same Lambda invocation — decide match and notify-worthiness, including explicitly returning "no match" rather than forcing a pick, and record that verdict into the S3-backed price history in-process (no external round trip / no separate `record-verdict` caller) | E7, E8 |
+| FR6 | Persist every observation (price, discount, stock) to an append-only, timestamped history log per product URL, stored as a single JSON object — in S3 once configured, or a local JSON file when no S3 bucket is configured (pre-deployment on-demand use, see FR10) | E6 |
+| FR7 | Expose the pipeline's `run(ctx, cfg) (Response, error)` core via two invocation modes over the same three-way outcome contract: (a) an AWS Lambda handler (invoked by EventBridge Scheduler) wrapping `run` with `lambda.Start`, and (b) a first-class on-demand local mode — running `cmd/priceradar` directly (`go run ./cmd/priceradar` or a built binary) outside the Lambda runtime executes `run` once and reports the same `Response`/error via stdout/exit code. Outcomes: success (`(Response, nil)`), hard error (`(nil, err)`), needs-agent-review (`(Response{status:"needs_agent_review"}, nil)`) | E7 |
+| FR8 | Let the judgment layer — `internal/judge`, calling the Claude API directly with `skill/judgment.md` + the shortlist, within the same invocation (Lambda or on-demand local) — decide match and notify-worthiness, including explicitly returning "no match" rather than forcing a pick, and record that verdict into the price history store in-process (no external round trip / no separate `record-verdict` caller) | E7, E8 |
 | FR9 | Notify (log line, SNS/email, or chat message — channel decoupled from the decision) only when the judgment layer's verdict says so | E9 |
+| FR10 | `cmd/priceradar/main()` selects invocation mode automatically and without configuration: if `AWS_LAMBDA_RUNTIME_API` is set, run as a Lambda handler (`lambda.Start`); otherwise run `run(ctx, cfg)` once as an on-demand local trigger, print the resulting `Response` as JSON to stdout (or the error to stderr), and exit 0 on success/`needs_agent_review`, 1 on hard error | E7 |
 
 ## Non-goals (v1)
 
@@ -36,7 +37,7 @@ These are hard boundaries, not soft defaults — an agent must not silently cros
 - No continuous/real-time polling — scheduled (EventBridge Scheduler), low-frequency checks only.
 - No third-party HTTP framework, no third-party HTML parser by default, no LLM calls inside `httpclient`/`browser`/`parser`/`prefilter`/`store` (`chromedp` is the one sanctioned scraping dependency, scoped to `internal/browser`; `aws-sdk-go-v2` and `aws-lambda-go` are the sanctioned AWS-integration dependencies). The judgment layer (`internal/judge`) *does* call the Claude API at runtime by design — see ADR-010 — that exception is scoped to judgment only and does not extend to the deterministic stages.
 - No runtime-read selector-override mechanism for selector-miss recovery — the fix is always a reviewed code commit + redeploy (see ADR-009).
-- No MCP extension or second-site support in v1 — both are explicitly deferred (E11, E12 in the Implementation Plan), trigger-based, not scheduled work.
+- No MCP extension or second-site support in v1 — both are explicitly deferred (E11, E12 in the Implementation Plan), trigger-based, not scheduled work. MCP (E11) is specifically deferred **until the Lambda is deployed to AWS** — it is the intended *future production* on-demand trigger (interactive, MCP-host-invoked, independent of a schedule). Until then, the on-demand need is met by running `cmd/priceradar` locally in its on-demand mode (see FR10) — a first-class trigger mode, not merely a test/dev affordance.
 
 ## Constraints
 
@@ -46,9 +47,11 @@ Tech-stack, compliance, and selector-strategy constraints are enforced in `CLAUD
 
 Tied to the Implementation Plan's E10 (hardening epic):
 - `go test ./...` passes across all packages, without requiring AWS credentials or a deployed Lambda function.
-- All three Lambda handler outcomes (success / hard error / `needs_agent_review`) are reachable on demand (local invocation of the extracted `run(...)` function) and match the documented JSON shape exactly.
+- All three handler outcomes (success / hard error / `needs_agent_review`) are reachable both ways: as a Lambda invocation and via `cmd/priceradar`'s on-demand local trigger mode (FR10) — the latter is a first-class, documented product trigger, not only a test harness — and match the documented JSON shape exactly in both modes.
+- The on-demand local trigger runs to a real outcome (success, hard error, or `needs_agent_review`) without requiring a deployed Lambda function or any AWS resources configured — falling back to local-file storage and log-only notify when `config.json`'s S3/SNS fields are empty (see ADR-011).
+- Two overlapping invocations of `internal/store`'s S3-backed write path (e.g. an on-demand run overlapping a scheduled Lambda run) never silently lose an appended snapshot: the conditional-write retry loop (ADR-012) either reconciles both writes or the losing writer retries and succeeds, bounded by a fixed retry budget.
 - No code path ever constructs a disallowed URL (filtered query params, `/ajax/`, the internal API).
-- The judgment round trip — shortlist → `internal/judge` calls the Claude API with `skill/judgment.md` → verdict recorded into the S3-backed price history — is demonstrated end-to-end at least once within a single handler invocation.
+- The judgment round trip — shortlist → `internal/judge` calls the Claude API with `skill/judgment.md` → verdict recorded into the price history store — is demonstrated end-to-end at least once within a single invocation (Lambda or on-demand local).
 
 ## Change control
 

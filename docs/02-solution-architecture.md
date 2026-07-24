@@ -28,6 +28,22 @@ flowchart LR
     E --> G[Notify\nSNS/log]
 ```
 
+### 0. Trigger modes (how a run starts)
+
+The pipeline core (Fetch → Parse → Prefilter → Judgment → Store → Notify) is invoked the same way regardless of *why* a run started — only the entry point differs. Three trigger modes exist across the project's timeline, not simultaneously from day one:
+
+| Mode | When available | Invoked by | Status |
+|---|---|---|---|
+| Scheduled (Lambda) | Once deployed to AWS | EventBridge Scheduler, cron | Documented, not yet deployed |
+| On-demand local | Now, pre-deployment | Running `cmd/priceradar` directly (no Lambda runtime present) | First-class, current dev-stage trigger — see ADR-011 |
+| On-demand interactive (MCP) | After Lambda is deployed | An MCP-capable agent host calling `cmd/priceradar-mcp` tools | Deferred (E11) until post-deployment |
+
+All three modes call the same extracted `run(ctx, cfg) (Response, error)` (or, for MCP, the same `internal/*` packages directly) and observe the same three-way outcome contract (ADR-008) — there is exactly one pipeline core and one outcome contract, never a second one invented per trigger.
+
+**Why on-demand local now, MCP later:** MCP's stdio server (E11) is real infrastructure to build (tool definitions, resource serving, a second entrypoint) that only earns its cost once there's a deployed Lambda in production to complement with an interactive path. Before that, the fastest way to get an on-demand trigger is the one that already exists implicitly — running the extracted `run(...)` locally — promoted from "something tests happen to do" to "a documented, supported way to trigger a real check right now." See ADR-011.
+
+**Store-concurrency implication:** ADR-007 justified S3's single whole-object `PutObject` as safe because EventBridge invoked the Lambda on one non-overlapping schedule — "exactly one writer at a time by construction." Once an on-demand local trigger can run at any time, that construction no longer holds: a local run can overlap a scheduled Lambda invocation (or, later, an MCP-triggered run). `internal/store`'s S3 backend therefore needs real conditional-write protection (ETag-conditioned `PutObject` + get-modify-put retry), not just an accepted-risk note — see ADR-012 and [System Architecture § `internal/store`](03-system-architecture.md#internalstore). Pre-deployment, when the on-demand trigger runs against the local-file storage fallback instead of S3 (see [System Architecture § `internal/store`](03-system-architecture.md#internalstore)), there is no concurrent-writer problem at all — it's a single machine, single process.
+
 ### 1. Fetch
 Two parts, because the listing page has no URL-based pagination (confirmed empirically — `?trang=`, `?page=`, `?p=` all return the identical first batch):
 - The initial batch is a plain HTTP GET against the clean listing URL. Sends a realistic User-Agent, retries with exponential backoff on 429/5xx. Never requests the filtered/query-parameter URLs `robots.txt` disallows.
@@ -67,7 +83,7 @@ An append-only, timestamped log of every observation per product URL (price, dis
 Fires only when judgment's verdict says so (new match, price drop, price below threshold). Delivery channel is decoupled from the decision — a log line, an SNS/email notification, or a chat message are equally valid.
 
 ## Extension point: MCP
-The same deterministic core (fetch → parse → prefilter → store) can be exposed as an MCP server in addition to running as a scheduled one-shot batch job, so any MCP-capable agent host can call it interactively rather than only on a timer. This is additive — it does not change the pipeline above, only how it's invoked. See [System Architecture § MCP Extension](03-system-architecture.md#6-mcp-extension-optional) for the concrete shape. The Structure Verification hand-off (§1a above) is expected to become one of these MCP tools eventually (`verify_page_structure`) — deferred alongside the rest of the MCP extension, not built now.
+The same deterministic core (fetch → parse → prefilter → store) can be exposed as an MCP server in addition to running as a scheduled one-shot batch job, so any MCP-capable agent host can call it interactively rather than only on a timer. This is the **planned production on-demand path**, taking over from the local on-demand trigger (§0 above) once the Lambda is deployed — the local trigger doesn't disappear (it remains useful for direct dev-stage checks), but MCP becomes the intended interactive front door once it exists. This is additive — it does not change the pipeline above, only how it's invoked. See [System Architecture § MCP Extension](03-system-architecture.md#6-mcp-extension-optional) for the concrete shape. The Structure Verification hand-off (§1a above) is expected to become one of these MCP tools eventually (`verify_page_structure`) — deferred alongside the rest of the MCP extension, not built now.
 
 ## Why this shape, not simpler
 - **Why not one Go program that also decides notify?** — Because "does this listing match a loosely-specified target" and "is this price worth flagging" are exactly the kind of judgment calls that break brittle regex/threshold rules whenever the site's naming conventions shift slightly. A hard rule set has to be exhaustively pre-anticipated; an agent given clear instructions can adapt without new code being shipped.

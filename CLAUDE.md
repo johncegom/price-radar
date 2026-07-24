@@ -28,7 +28,7 @@ Only a short list (0–5 candidates), never the full ~650-item catalog, is ever 
 ```
 priceradar/
   cmd/
-    priceradar/            # Lambda handler entrypoint (default, EventBridge Scheduler-invoked); also runnable/testable locally, not AWS-only
+    priceradar/            # dual-mode entrypoint: Lambda handler (EventBridge-invoked) when deployed, first-class on-demand local trigger otherwise
     priceradar-mcp/        # optional MCP server entrypoint (extension, build later)
   internal/
     httpclient/            # net/http.Client wrapper: UA header, timeout, retry/backoff
@@ -54,7 +54,7 @@ Data flow: EventBridge Scheduler → Lambda invocation → Fetch (httpclient for
 - **No third-party HTML parser by default** — `regexp` (stdlib) for parsing product cards. `golang.org/x/net/html` is an explicitly-flagged fallback only if regex proves too fragile, not a default choice.
 - **`chromedp` is the one sanctioned third-party dependency for scraping**, scoped narrowly to `internal/browser`, because the listing has no URL-based pagination (`?trang=`, `?page=`, `?p=` all verified to return the identical first batch) and the site's internal API + filtered-URL scraping are both off-limits (see Compliance below). Don't reach for `go-rod`/`playwright-go` or add other scraping dependencies without an equivalent justification. On Lambda, chromedp additionally needs a headless-Chromium Lambda Layer (e.g. a `sparticuz/chromium`-style prebuilt layer) — see `docs/03-system-architecture.md` for the layer/memory/timeout details.
 - **AWS SDK for Go v2** (`aws-sdk-go-v2`, S3 + SNS clients only) and **`aws-lambda-go`** (the Lambda runtime shim) are sanctioned dependencies for the AWS integration surface — same "narrowly scoped, deliberately justified" treatment as chromedp, not a general license to add AWS SDK modules elsewhere.
-- **Storage:** `encoding/json`, one JSON object (`price-history.json` as an S3 key), no database. Writes are whole-object `PutObject` calls — S3 already makes a single object write atomic from a reader's perspective, so there's no local temp-file/`os.Rename` step to replicate.
+- **Storage:** `encoding/json`, one JSON object (`price-history.json` as an S3 key), no database. Writes are whole-object `PutObject` calls, protected by an ETag-conditioned (`If-Match`/`If-None-Match`) get-modify-put retry loop rather than a bare overwrite — S3 makes a single write atomic from a reader's perspective, but with more than one possible writer now (scheduled Lambda + on-demand local trigger, see ADR-011), the conditional-write retry is what prevents a lost update; see ADR-012 and `docs/03-system-architecture.md` § `internal/store`. Pre-deployment, when no S3 bucket is configured, `internal/store` falls back to a local JSON file instead — no concurrency protection needed there (single machine, single process).
 - **Scheduling:** AWS EventBridge Scheduler invoking the Lambda function on a cron expression — not an in-process daemon/goroutine scheduler, and not an OS-level scheduler (superseded; see ADR-006).
 - **Judgment-layer LLM calls:** the Claude API, called directly from `internal/judge` inside the Lambda handler over `net/http` (no SDK needed for a single-request/response call) — see ADR-010. Structure-verification (selector-miss, below) deliberately does **not** get this treatment.
 
@@ -69,6 +69,10 @@ Data flow: EventBridge Scheduler → Lambda invocation → Fetch (httpclient for
 | `needs_agent_review` | `(Response{status: "needs_agent_review", step: "load_more_detection", reason: "primary_selector_not_found", screenshot_url: <S3 URL>, dom_candidates: [...]}, nil)` | `internal/browser` couldn't locate the "Load more" control |
 
 `needs_agent_review` deliberately returns as a **successful** invocation (`nil` error), not a Lambda error — retrying immediately won't fix a broken selector, so this must not trigger Lambda's automatic retry storm. Instead the handler itself uploads the screenshot to S3 and publishes an SNS notification before returning, so a human/agent can review it later; see ADR-009. This mirrors the original exit-code design's intent — distinguishing "retry might help" from "a human/agent needs to look at this" — just adapted to Lambda's return-value contract instead of a process exit code that an always-present watcher would inspect live.
+
+## Invocation modes
+
+`cmd/priceradar/main()` picks its mode by checking for the `AWS_LAMBDA_RUNTIME_API` env var (set by the Lambda runtime, absent locally): present → `lambda.Start(handler)`; absent → run `run(ctx, cfg)` once as an on-demand local trigger, printing the `Response` JSON to stdout and exiting `0`/`1` per the same three-way contract above (see ADR-011). This on-demand mode is a first-class, documented trigger — not just a test harness — usable today, pre-deployment, and it works without any AWS resources provisioned: `internal/store`/`internal/notify` fall back to a local JSON file / log-only notify when `config.json` has no S3/SNS configured. Once the Lambda is deployed, the MCP extension (E11, deferred until then) becomes the intended production-facing on-demand trigger instead; the local mode keeps working alongside it for direct dev-stage use.
 
 ## Compliance constraints (do not violate when writing fetch/browser code)
 

@@ -69,6 +69,12 @@ The one sanctioned third-party dependency; keep it scoped to this package only.
 - **T6.1** `internal/store`: `GetObject` price history from S3 (missing key → empty map, not error), append snapshot per product URL, `PutObject` the whole object back (see ADR-007 — no temp-file/`os.Rename` step needed, a whole-object `PutObject` is already atomic to readers).
   Done: tests cover missing-key-first-run, append-then-reload round-trip against a mocked S3 client, additive history (no dedup — multiple snapshots per URL retained).
   Depends on: E1.
+- **T6.2** Conditional-write concurrency protection: replace the bare `GetObject`→append→`PutObject` sequence with a retry loop using S3 conditional writes — capture the `ETag` from `GetObject`, set `If-Match: <etag>` on `PutObject` (or `If-None-Match: "*"` when no object existed yet), retry from the read on `412 Precondition Failed` up to a fixed bound (e.g. 5 attempts) with short exponential backoff, and return an error if retries are exhausted (surfaces via the existing hard-error path, ADR-008). Supersedes the "exactly one writer at a time by construction" assumption in ADR-007 (see ADR-012).
+  Done: tests against a mocked S3 client cover: no-conflict single-writer append (unchanged behavior), a simulated concurrent-write conflict (mock returns 412 on first `PutObject` attempt, succeeds on retry after a second `GetObject`) resulting in both writers' snapshots present, and retries-exhausted-returns-error (mock always returns 412) without silently dropping the snapshot.
+  Depends on: T6.1.
+- **T6.3** Local-file storage/notify fallback for pre-deployment on-demand use: `internal/store` selects a local-file backend (`os.ReadFile`/`os.WriteFile`, same JSON shape) instead of S3 when `config.json` has no S3 bucket configured; `internal/notify` skips the SNS publish (log line only) when no SNS topic ARN is configured. Backend/channel selection is driven purely by config presence, never by which trigger invoked the run (see ADR-011).
+  Done: tests confirm `internal/store` round-trips through the local-file backend when S3 config is absent, and `internal/notify` doesn't attempt an SNS call when no topic ARN is set.
+  Depends on: T6.1.
 
 ### E7 — Lambda handler wiring + outcome contract
 - **T7.1** `cmd/priceradar/main.go` happy path: config → httpclient fetch → browser fetch full catalog → parse → prefilter → judgment (`internal/judge` calls Claude API) → append snapshots + verdict to S3-backed store → notify if warranted → return `Response{shortlist, since_last_run, verdict}`. Extract a testable `run(ctx, cfg) (Response, error)` so outcome-path tests don't need a real Lambda runtime; `main()` is a thin `lambda.Start(handler)` wrapper around it.
@@ -80,6 +86,9 @@ The one sanctioned third-party dependency; keep it scoped to this package only.
 - **T7.3** `needs_agent_review` path: wire `internal/browser`'s selector-miss result to `Response{status, step, reason, screenshot_url, dom_candidates}` returned as `(Response, nil)` — deliberately not an error, so Lambda's automatic retry doesn't fire (see ADR-008/ADR-009).
   Done: test forcing selector-miss asserts `nil` error and exact field set.
   Depends on: T7.1, T4.4.
+- **T7.4** Dual-invocation-mode `main()`: detect `AWS_LAMBDA_RUNTIME_API` env var; if present, `lambda.Start(handler)` (existing behavior); if absent, run `run(ctx, cfg)` once (on-demand local trigger), marshal `Response` to stdout on `(Response, nil)` and exit `0`, or write the error to stderr and exit `1` on `(nil, err)`. No new outcome contract — reuses T7.1–T7.3's exact `Response`/error shapes (see ADR-011).
+  Done: test invoking the extracted dispatch logic (e.g. a small `runOnDemand(cfg) int` helper returning the exit code, so this is testable without spawning a real subprocess) confirms: success and `needs_agent_review` both produce exit `0` + correct JSON on stdout; hard error produces exit `1` + error on stderr; presence/absence of `AWS_LAMBDA_RUNTIME_API` correctly selects the Lambda vs. on-demand branch.
+  Depends on: T7.1, T7.2, T7.3.
 
 ### E8 — Judgment layer
 - **T8.1** Write `skill/judgment.md`: matching rules (chip generation, RAM/storage order, "Demo"/refurb labels), notify rules (new match, meaningful price drop, below-threshold), explicit output contract (matched URL or none, confidence, one-line reason) — must allow "no match" as a valid verdict, not force a pick.
@@ -109,7 +118,7 @@ The one sanctioned third-party dependency; keep it scoped to this package only.
 ## Deferred epics (trigger-based, not scheduled)
 
 ### E11 — MCP extension
-`cmd/priceradar-mcp` exposing `fetch_listings`, `get_price_history`, `get_target_config` tools + `judgment-instructions` resource, later `verify_page_structure`. Explicitly not built now — only build once an MCP-capable agent host is actually going to be used interactively against this repo.
+`cmd/priceradar-mcp` exposing `fetch_listings`, `get_price_history`, `get_target_config` tools + `judgment-instructions` resource, later `verify_page_structure`. Explicitly not built now — deferred **until the Lambda (E10.3) is deployed to AWS**, at which point MCP becomes the intended production on-demand/interactive trigger, taking over that role from the local on-demand trigger (E7, T7.4) that covers the on-demand need pre-deployment. Building MCP earlier would front-run a need already met by T7.4.
 
 ### E12 — Second-site extensibility
 `internal/siteplugin` interface, migrate FPT Shop logic into `internal/sites/fptshop/`, add `site` field to `config.json` targets. Deliberately deferred until a second real site is real — do not build speculatively.
@@ -123,12 +132,13 @@ E3 → E4 (cross-check dependency)
 E2, E3, E4, E5, E6 → E7
 E7 → E8 → E9
 E7, E8, E9 → E10
-[deferred] E11, E12 — build on E0–E10's internal/* packages, not scheduled
+[deferred] E11 — build on E0–E10's internal/* packages, not scheduled; specifically wait until E10.3 (Lambda deployment) is live
+[deferred] E12 — build on E0–E10's internal/* packages, not scheduled; wait until a second real site exists
 ```
 
 ## Verification
 
 - Per-package: `go test ./...` after each epic lands; each task above lists its own done signal.
-- End-to-end (E10.1): invoke the extracted `run(ctx, cfg)` against fixture/mocked HTTP + a Chrome-gated browser test, confirm all three handler outcomes (success / hard error / `needs_agent_review`) are reachable on demand and their JSON shapes match `CLAUDE.md`'s documented contract exactly — no deployed Lambda or AWS credentials required for this.
+- End-to-end (E10.1): invoke the extracted `run(ctx, cfg)` against fixture/mocked HTTP + a Chrome-gated browser test, confirm all three handler outcomes (success / hard error / `needs_agent_review`) are reachable on demand and their JSON shapes match `CLAUDE.md`'s documented contract exactly — no deployed Lambda or AWS credentials required for this. Additionally (T7.4), confirm the same three outcomes are reachable through the on-demand local dispatch path (non-Lambda-runtime branch of `main()`), and (T6.2) confirm `internal/store`'s conditional-write retry loop resolves a simulated concurrent-write conflict without losing a snapshot.
 - Compliance (E10.2): guardrail tests plus a manual review that no disallowed URL is ever constructed.
 - No live-site scraping should be part of automated tests — all HTTP/browser tests run against local fixtures (`httptest.Server` / saved HTML), per the compliance posture (infrequent, low-volume real requests only).
