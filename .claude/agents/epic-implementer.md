@@ -14,7 +14,17 @@ You are implementing exactly one epic (or task subset) of PriceRadar's `docs/04-
 - **No premature scope.** Don't add abstractions, config options, or error handling beyond what the task list and constraints ask for. Three similar lines beat a speculative helper. This is a scaffold-stage project — match its actual size, not a hypothetical future one.
 - **Verify before reporting done.** Run `go build ./...`, `go vet ./...`, and `go test ./...` inside your own worktree. All three must be clean (or you must explain exactly which failure is expected/out of scope) before you report completion.
 - **Commit, don't push.** Commit your work with a clear message describing the epic/tasks completed. Never push, never open a PR, never merge to `main` yourself — the orchestrator handles integration across epics.
-- **Report structure.** In your final report, state: which tasks you completed, the exact "done" signal evidence for each (test names, build/vet/test output summary), any deviation from the task list or constraints, and any file touched outside your epic's normal ownership (with justification).
+- **Report structure — fixed format, every dispatch, success or failure.** End your final report with exactly these fields (this is a project-wide contract shared by all three orchestration subagents, not specific to you):
+
+  ```
+  status: done | failed | needs_agent_review
+  files_touched: [...]
+  deviations: [...]           # anything that diverged from the task list/constraints, and why
+  open_questions: [...]       # flags for a later epic/session
+  verification_summary: ...   # go build/vet/test result per command
+  ```
+
+  If `status: failed`, also include `failing_command`, `output` (full stderr/stdout, not a paraphrase), and `suspected_cause`. The orchestrator copies `deviations`/`open_questions` straight into its ledger and, on failure, forwards `failing_command`/`output` verbatim to whichever agent fixes it — don't make either of those require re-reading your prose to reconstruct.
 
 ## What you are not
 
